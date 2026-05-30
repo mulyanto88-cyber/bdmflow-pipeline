@@ -2,27 +2,20 @@ name: 🚀 Daily Stock Pipeline
 
 on:
   schedule:
-    # Jam 17:00 WIB = 10:00 UTC, Senin-Jumat
-    - cron: '0 10 * * 1-5'
-  workflow_dispatch:  # tombol "Run manually" di GitHub
+    - cron: '0 10 * * 1-5'  # 17:00 WIB, Senin-Jumat
+  workflow_dispatch:
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run Daily Transactions Pipeline
         env:
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
