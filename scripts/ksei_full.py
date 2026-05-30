@@ -17,7 +17,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 SA_JSON          = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON'])
 MOTHERDUCK_TOKEN = os.environ['MOTHERDUCK_TOKEN']
 
-FOLDER_ZIP_ID    = 'FOLDER_ID_KSEI_FULL_ZIP'  # ← ganti dengan folder ID ZIP KSEI
+FOLDER_ZIP_ID    = '1MnKL8m75GRH_WO1fllPTyGK9LJVDfuwP'  # ← ganti dengan folder ID ZIP KSEI
 FOLDER_OUTPUT_ID = '1hX2jwUrAgi4Fr8xkcFWjCW6vbk6lsIlP'
 OUTPUT_CSV_NAME  = 'KSEI_Shareholder_Pure_KSEI_Only.csv'
 MOTHERDUCK_DB    = 'my_db'
