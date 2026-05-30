@@ -6,3 +6,5 @@ google-auth
 google-auth-httplib2
 tqdm
 pdfplumber
+requests
+pyarrow
