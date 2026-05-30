@@ -1,0 +1,48 @@
+name: 📦 KSEI Monthly Pipeline (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pipeline:
+        description: 'Pipeline mana yang mau dijalankan?'
+        required: true
+        default: 'ksei_1pct'
+        type: choice
+        options:
+          - ksei_1pct
+          - ksei_full
+
+jobs:
+  run-ksei-1pct:
+    if: ${{ github.event.inputs.pipeline == 'ksei_1pct' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run KSEI 1% Monthly Pipeline
+        env:
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python scripts/ksei_1pct.py
+
+  run-ksei-full:
+    if: ${{ github.event.inputs.pipeline == 'ksei_full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run KSEI Full Monthly Pipeline
+        env:
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python scripts/ksei_full.py
