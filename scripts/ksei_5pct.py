@@ -19,7 +19,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 SA_JSON          = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON'])
 MOTHERDUCK_TOKEN = os.environ['MOTHERDUCK_TOKEN']
 
-FOLDER_PDF_ID    = '1YOUR_KSEI_5PCT_FOLDER_ID'  # ← ganti dengan folder ID KSEI 5%
+FOLDER_PDF_ID    = '13cvZII7kxFqfeEMUS8TuQMpgkAY8vZg8'  # ← ganti dengan folder ID KSEI 5%
 FOLDER_BACKUP_ID = '1hX2jwUrAgi4Fr8xkcFWjCW6vbk6lsIlP'
 BACKUP_CSV_NAME  = 'MASTER_DATABASE_5persen_CLEAN.csv'
 MOTHERDUCK_DB    = 'my_db'
