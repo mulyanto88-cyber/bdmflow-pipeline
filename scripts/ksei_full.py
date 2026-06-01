@@ -32,6 +32,12 @@ FOLDER_OUTPUT_ID = '1hX2jwUrAgi4Fr8xkcFWjCW6vbk6lsIlP'
 OUTPUT_CSV_NAME  = 'KSEI_Shareholder_Pure_KSEI_Only.csv'
 MOTHERDUCK_DB    = 'my_db'
 
+# Set to False to skip the Drive CSV audit upload entirely.
+# Service Accounts have no Drive storage quota, so CSV upload only works if
+# FOLDER_OUTPUT_ID lives in a Shared Drive. The MotherDuck update does NOT
+# depend on this; failure here is logged but does not fail the pipeline.
+UPLOAD_CSV_BACKUP = True
+
 # Position columns AFTER header normalisation (spaces -> underscores).
 LOCALS   = ['Local_IS','Local_CP','Local_PF','Local_IB','Local_ID',
             'Local_MF','Local_SC','Local_FD','Local_OT']
@@ -290,9 +296,6 @@ def main():
     print(f"✅ Raw parsed: {len(raw):,} rows, "
           f"{raw['Date'].nunique()} months, {raw['Code'].nunique()} codes")
 
-    # Optional: keep the CSV snapshot in Drive for human inspection.
-    upload_csv_to_drive(raw, service)
-
     # ---- Phase 1b: register DataFrame to MotherDuck connection (NOT a table) ----
     print("\n🦆 Connecting to MotherDuck...")
     con = duckdb.connect(f'md:{MOTHERDUCK_DB}?motherduck_token={MOTHERDUCK_TOKEN}')
@@ -324,6 +327,20 @@ def main():
         )
 
     con.close()
+    print("   ✅ DB updated — critical path complete.")
+
+    # ---- Phase 3 (optional, non-fatal): CSV audit backup to Drive ----
+    if UPLOAD_CSV_BACKUP:
+        print("\n📤 Uploading audit CSV to Drive (optional)...")
+        try:
+            upload_csv_to_drive(raw, service)
+        except Exception as e:
+            print(f"   ⚠️  CSV upload skipped (NON-FATAL): {str(e)[:200]}")
+            print("       → To fix: move FOLDER_OUTPUT_ID to a Shared Drive,")
+            print("         or set UPLOAD_CSV_BACKUP=False to silence this step.")
+    else:
+        print("\n⏭️  CSV audit upload disabled by config (UPLOAD_CSV_BACKUP=False)")
+
     print(f"\n🎉 DONE in {(time.time()-start)/60:.1f} min")
 
 if __name__ == "__main__":
