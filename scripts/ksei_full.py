@@ -326,14 +326,14 @@ def main():
             "Inspect raw_df column names before transform."
         )
 
-    con.close()
-    print("   ✅ DB updated — critical path complete.")
-
     # ---- Phase 3 (optional, non-fatal): CSV audit backup to Drive ----
+    # Exported FROM MotherDuck (after transform) so it includes all derived columns:
+    # _1 (prev month positions), _Chg_Vol, _Chg_Val, Top_Buyer/Seller, split flags.
     if UPLOAD_CSV_BACKUP:
-        print("\n📤 Uploading audit CSV to Drive (optional)...")
+        print("\n📤 Exporting full snapshot from DB → Drive CSV (optional)...")
         try:
-            upload_csv_to_drive(raw, service)
+            df_export = con.execute("SELECT * FROM ksei.monthly_snapshot ORDER BY Code, Date").df()
+            upload_csv_to_drive(df_export, service)
         except Exception as e:
             print(f"   ⚠️  CSV upload skipped (NON-FATAL): {str(e)[:200]}")
             print("       → To fix: move FOLDER_OUTPUT_ID to a Shared Drive,")
@@ -341,6 +341,7 @@ def main():
     else:
         print("\n⏭️  CSV audit upload disabled by config (UPLOAD_CSV_BACKUP=False)")
 
+    con.close()
     print(f"\n🎉 DONE in {(time.time()-start)/60:.1f} min")
 
 if __name__ == "__main__":
