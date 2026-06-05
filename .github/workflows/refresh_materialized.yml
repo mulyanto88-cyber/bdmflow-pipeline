@@ -105,7 +105,7 @@ jobs:
           FROM scored sc
           LEFT JOIN market.company_profile cp ON cp.stock_code = sc.clean_code
           LEFT JOIN market.vw_smart_money_score sms ON sms.stock_code = sc.clean_code
-          WHERE sc.net_accumulation > 0\"
+          WHERE sc.net_accumulation > 0\"\"\"
           for days in [5, 14, 30, 60, 90]:
               sql = broker_sql.replace('__DAYS__', str(days))
               refresh(f'market.tb_broker_accum_{days}d', sql)
