@@ -1,0 +1,235 @@
+name: 🔄 Refresh Materialized Tables — 21:00 WIB
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  refresh-all:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install duckdb
+        run: pip install duckdb==1.5.2
+      - name: Refresh all 9 materialized tables
+        env:
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+        run: |
+          python -c "
+          import duckdb, os, time
+          con = duckdb.connect(f'md:my_db?motherduck_token={os.environ[\"MOTHERDUCK_TOKEN\"]}')
+
+          def refresh(tbl, sql):
+              start = time.time()
+              print(f'  Refreshing {tbl}... ', end='', flush=True)
+              con.execute(f'CREATE OR REPLACE TABLE {tbl} AS {sql}')
+              n = con.execute(f'SELECT COUNT(*) FROM {tbl}').fetchone()[0]
+              print(f'{n} rows ({time.time()-start:.1f}s)')
+
+          # 1-6: view-based tables
+          refresh('market.tb_broker_screener',  'SELECT * FROM market.vw_d_composite_tab')
+          refresh('market.tb_foreign_screener', 'SELECT * FROM market.vw_d_daily_flow_tab')
+          refresh('ksei.tb_ksei_screener',      'SELECT * FROM ksei.vw_d_ksei_tab')
+          refresh('market.tb_market_summary',   'SELECT * FROM market.vw_market_summary')
+          refresh('market.tb_market_pulse',     'SELECT * FROM market.vw_d_market_pulse_tab')
+          refresh('market.tb_radar',            'SELECT * FROM market.vw_watchlist_radar')
+
+          # 7: broker accumulation (90-day CTE from broker_activity)
+          refresh('market.tb_broker_accumulation', \"\"\"
+          WITH stock_agg AS (
+              SELECT LEFT(stock_code,4) AS clean_code,
+                  SUM(CASE WHEN value>0 THEN value ELSE 0 END)::DOUBLE AS total_buy,
+                  ABS(SUM(CASE WHEN value<0 THEN value ELSE 0 END))::DOUBLE AS total_sell,
+                  SUM(value)::DOUBLE AS net_accumulation,
+                  SUM(ABS(value))::DOUBLE AS total_value,
+                  COUNT(DISTINCT broker_code) AS broker_count,
+                  COUNT(DISTINCT CASE WHEN value>0 THEN broker_code END) AS buy_broker_count,
+                  COUNT(DISTINCT CASE WHEN value<0 THEN broker_code END) AS sell_broker_count
+              FROM main.broker_activity
+              WHERE CAST(date AS DATE) >= CURRENT_DATE - INTERVAL '90 days'
+              GROUP BY LEFT(stock_code,4)
+          ),
+          top_buyer AS (
+              SELECT LEFT(stock_code,4) AS clean_code, broker_code,
+                  SUM(CASE WHEN value>0 THEN value ELSE 0 END)::DOUBLE AS buy_val,
+                  ROW_NUMBER() OVER (PARTITION BY LEFT(stock_code,4) ORDER BY SUM(CASE WHEN value>0 THEN value ELSE 0 END) DESC) AS rn
+              FROM main.broker_activity
+              WHERE CAST(date AS DATE) >= CURRENT_DATE - INTERVAL '90 days'
+              GROUP BY LEFT(stock_code,4), broker_code
+          ),
+          local_agg AS (
+              SELECT LEFT(ba.stock_code,4) AS clean_code,
+                  SUM(CASE WHEN ba.value>0 THEN ba.value ELSE 0 END)::DOUBLE AS local_buy,
+                  SUM(ba.value)::DOUBLE AS local_net
+              FROM main.broker_activity ba
+              JOIN main.broker_classification bc ON bc.broker_code = ba.broker_code
+              WHERE CAST(ba.date AS DATE) >= CURRENT_DATE - INTERVAL '90 days' AND LOWER(bc.category) <> 'foreign'
+              GROUP BY LEFT(ba.stock_code,4)
+          ),
+          foreign_agg AS (
+              SELECT LEFT(ba.stock_code,4) AS clean_code,
+                  SUM(CASE WHEN ba.value>0 THEN ba.value ELSE 0 END)::DOUBLE AS foreign_buy,
+                  SUM(ba.value)::DOUBLE AS foreign_net
+              FROM main.broker_activity ba
+              JOIN main.broker_classification bc ON bc.broker_code = ba.broker_code
+              WHERE CAST(ba.date AS DATE) >= CURRENT_DATE - INTERVAL '90 days' AND LOWER(bc.category) = 'foreign'
+              GROUP BY LEFT(ba.stock_code,4)
+          ),
+          scored AS (
+              SELECT sa.clean_code, sa.total_buy, sa.total_sell, sa.net_accumulation, sa.total_value,
+                  sa.broker_count, sa.buy_broker_count, sa.sell_broker_count,
+                  ROUND(sa.total_sell / NULLIF(sa.total_buy, 0) * 100, 1)::DOUBLE AS sell_pressure_pct,
+                  GREATEST(0.4, 1.0 - (sa.total_sell / NULLIF(sa.total_buy + sa.total_sell, 0)) * 0.6) AS sp_factor,
+                  sa.net_accumulation / NULLIF(sa.total_value, 0) AS net_ratio,
+                  COALESCE(tb.buy_val, 0) AS top_buy_val,
+                  tb.broker_code AS top_buyer_code,
+                  ROUND(COALESCE(tb.buy_val,0)/NULLIF(sa.total_buy,0)*100,1)::DOUBLE AS top_buyer_pct,
+                  COALESCE(la.local_buy, 0) AS local_buy,
+                  COALESCE(la.local_net, 0) AS local_net,
+                  COALESCE(fa.foreign_buy, 0) AS foreign_buy,
+                  COALESCE(fa.foreign_net, 0) AS foreign_net,
+                  ROUND(COALESCE(fa.foreign_buy,0)/NULLIF(sa.total_buy,0)*100,1)::DOUBLE AS foreign_buy_pct
+              FROM stock_agg sa
+              LEFT JOIN top_buyer tb ON sa.clean_code = tb.clean_code AND tb.rn = 1
+              LEFT JOIN local_agg la ON la.clean_code = sa.clean_code
+              LEFT JOIN foreign_agg fa ON fa.clean_code = sa.clean_code
+          )
+          SELECT sc.clean_code AS stock_code, cp.sector, cp.group_name AS company_name,
+              sms.close::DOUBLE AS latest_price, sms.change_percent::DOUBLE AS price_change_pct,
+              sc.total_buy, sc.total_sell, sc.net_accumulation,
+              ROUND(sc.net_accumulation/1e9, 3)::DOUBLE AS net_miliar, sc.total_value,
+              sc.broker_count, sc.buy_broker_count, sc.sell_broker_count, sc.sell_pressure_pct,
+              sc.top_buyer_code, sc.top_buyer_pct,
+              ROUND(sc.local_net/1e9, 3)::DOUBLE AS local_net_miliar,
+              ROUND(sc.foreign_net/1e9, 3)::DOUBLE AS foreign_net_miliar, sc.foreign_buy_pct,
+              sms.whale_signal, sms.big_player_anomaly, sms.smart_money_score, sms.signal AS smart_signal,
+              ROUND(sc.net_ratio * LN(1 + sc.buy_broker_count) * 100 * sc.sp_factor + COALESCE(sms.smart_money_score, 0) * 0.3 + CASE WHEN sms.whale_signal THEN 8 ELSE 0 END + CASE WHEN sms.big_player_anomaly THEN 4 ELSE 0 END, 1)::DOUBLE AS composite_score,
+              CURRENT_TIMESTAMP AS refreshed_at
+          FROM scored sc
+          LEFT JOIN market.company_profile cp ON cp.stock_code = sc.clean_code
+          LEFT JOIN market.vw_smart_money_score sms ON sms.stock_code = sc.clean_code
+          WHERE sc.net_accumulation > 0
+          \"\"\")
+
+          # 8: foreign multi-period screener (120-day from daily_transactions)
+          refresh('market.tb_foreign_multiperiod', \"\"\"
+          WITH mp AS (
+              SELECT dt.stock_code,
+                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '1 day'   THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f1d,
+                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '7 days'  THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f7d,
+                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '14 days' THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f14d,
+                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '30 days' THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f30d,
+                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '60 days' THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f60d,
+                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '90 days' THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f90d,
+                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '120 days'THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f120d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '1 day'   AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_1d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '1 day'   AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_1d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '7 days'  AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_7d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '7 days'  AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_7d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '14 days' AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_14d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '14 days' AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_14d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '30 days' AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_30d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '30 days' AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_30d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '60 days' AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_60d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '60 days' AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_60d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '90 days' AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_90d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '90 days' AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_90d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '120 days'AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_120d,
+                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '120 days'AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_120d,
+                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '120 days' THEN dt.foreign_buy_value  ELSE 0 END)::DOUBLE AS buy120d,
+                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '120 days' THEN dt.foreign_sell_value ELSE 0 END)::DOUBLE AS sell120d
+              FROM market.daily_transactions dt
+              WHERE dt.trading_date >= CURRENT_DATE - INTERVAL '120 days'
+              GROUP BY dt.stock_code
+          )
+          SELECT mp.stock_code, cp.group_name AS company_name, cp.sector,
+              sl.close::DOUBLE AS close, sl.change_percent::DOUBLE AS change_percent,
+              mp.f1d, mp.f7d, mp.f14d, mp.f30d, mp.f60d, mp.f90d, mp.f120d,
+              mp.buy_days_1d, mp.sell_days_1d, mp.buy_days_7d, mp.sell_days_7d,
+              mp.buy_days_14d, mp.sell_days_14d, mp.buy_days_30d, mp.sell_days_30d,
+              mp.buy_days_60d, mp.sell_days_60d, mp.buy_days_90d, mp.sell_days_90d,
+              mp.buy_days_120d, mp.sell_days_120d, mp.buy120d, mp.sell120d,
+              sms.smart_money_score, sms.whale_signal,
+              sms.broker_net::DOUBLE AS broker_net, sms.signal,
+              tact.net_foreign_1d::DOUBLE AS tact_foreign_1d,
+              tact.net_foreign_7d_miliar::DOUBLE AS tact_foreign_5d,
+              tact.broker_net_7d_miliar::DOUBLE AS broker_net_5d, tact.tactical_signal,
+              CURRENT_TIMESTAMP AS refreshed_at
+          FROM mp
+          LEFT JOIN market.company_profile cp ON cp.stock_code = mp.stock_code
+          LEFT JOIN market.vw_stock_latest sl ON sl.stock_code = mp.stock_code
+          LEFT JOIN market.vw_smart_money_score sms ON sms.stock_code = mp.stock_code
+          LEFT JOIN market.vw_tactical_momentum_smart_money tact ON tact.stock_code = mp.stock_code
+          WHERE mp.f30d <> 0
+          \"\"\")
+
+          # 9: KSEI monthly scored (LAG window + corp-action guard)
+          refresh('ksei.tb_ksei_monthly_scored', \"\"\"
+          WITH base AS (
+              SELECT Code, Date, Price::DOUBLE AS price,
+                  (Local_CP+Local_PF+Local_IB+Local_MF+Foreign_CP+Foreign_PF+Foreign_IB+Foreign_MF)::DOUBLE AS smart_vol,
+                  (Local_CP+Local_PF+Local_IB+Local_MF)::DOUBLE AS local_smart_vol,
+                  (Foreign_CP+Foreign_PF+Foreign_IB+Foreign_MF)::DOUBLE AS foreign_smart_vol,
+                  (Local_ID+Foreign_ID)::DOUBLE AS retail_vol,
+                  (Local_IS+Local_CP+Local_PF+Local_IB+Local_ID+Local_MF+Local_SC+Local_FD+Local_OT+Foreign_IS+Foreign_CP+Foreign_PF+Foreign_IB+Foreign_ID+Foreign_MF+Foreign_SC+Foreign_FD+Foreign_OT)::DOUBLE AS total_all,
+                  (Foreign_IS+Foreign_CP+Foreign_PF+Foreign_IB+Foreign_ID+Foreign_MF+Foreign_SC+Foreign_FD+Foreign_OT)::DOUBLE AS foreign_all,
+                  (Local_IS+Local_CP+Local_PF+Local_IB+Local_ID+Local_MF+Local_SC+Local_FD+Local_OT)::DOUBLE AS local_all,
+                  Top_Buyer, Top_Seller,
+                  ROW_NUMBER() OVER (PARTITION BY Code ORDER BY Date DESC) AS rn,
+                  LAG((Local_CP+Local_PF+Local_IB+Local_MF+Foreign_CP+Foreign_PF+Foreign_IB+Foreign_MF)) OVER (PARTITION BY Code ORDER BY Date) AS p1_smart,
+                  LAG((Local_CP+Local_PF+Local_IB+Local_MF+Foreign_CP+Foreign_PF+Foreign_IB+Foreign_MF), 2) OVER (PARTITION BY Code ORDER BY Date) AS p2_smart,
+                  LAG((Local_CP+Local_PF+Local_IB+Local_MF+Foreign_CP+Foreign_PF+Foreign_IB+Foreign_MF), 3) OVER (PARTITION BY Code ORDER BY Date) AS p3_smart,
+                  LAG((Local_CP+Local_PF+Local_IB+Local_MF)) OVER (PARTITION BY Code ORDER BY Date) AS p1_local,
+                  LAG((Foreign_CP+Foreign_PF+Foreign_IB+Foreign_MF)) OVER (PARTITION BY Code ORDER BY Date) AS p1_foreign,
+                  LAG((Local_ID+Foreign_ID)) OVER (PARTITION BY Code ORDER BY Date) AS p1_retail,
+                  LAG((Local_IS+Local_CP+Local_PF+Local_IB+Local_ID+Local_MF+Local_SC+Local_FD+Local_OT+Foreign_IS+Foreign_CP+Foreign_PF+Foreign_IB+Foreign_ID+Foreign_MF+Foreign_SC+Foreign_FD+Foreign_OT)) OVER (PARTITION BY Code ORDER BY Date) AS p1_total,
+                  LAG((Local_IS+Local_CP+Local_PF+Local_IB+Local_ID+Local_MF+Local_SC+Local_FD+Local_OT+Foreign_IS+Foreign_CP+Foreign_PF+Foreign_IB+Foreign_ID+Foreign_MF+Foreign_SC+Foreign_FD+Foreign_OT), 2) OVER (PARTITION BY Code ORDER BY Date) AS p2_total,
+                  LAG((Local_IS+Local_CP+Local_PF+Local_IB+Local_ID+Local_MF+Local_SC+Local_FD+Local_OT+Foreign_IS+Foreign_CP+Foreign_PF+Foreign_IB+Foreign_ID+Foreign_MF+Foreign_SC+Foreign_FD+Foreign_OT), 3) OVER (PARTITION BY Code ORDER BY Date) AS p3_total
+              FROM ksei.monthly_snapshot
+          ),
+          calc AS (
+              SELECT Code AS stock_code, price, Top_Buyer, Top_Seller, total_all, p1_total,
+                  CASE WHEN (total_all/NULLIF(p1_total,0) BETWEEN 0.6 AND 1.67) THEN ROUND((smart_vol-p1_smart)*price/1e9,2) END AS m0_smart,
+                  CASE WHEN (p1_total/NULLIF(p2_total,0) BETWEEN 0.6 AND 1.67) THEN ROUND((p1_smart-p2_smart)*price/1e9,2) END AS m1_smart,
+                  CASE WHEN (p2_total/NULLIF(p3_total,0) BETWEEN 0.6 AND 1.67) THEN ROUND((p2_smart-p3_smart)*price/1e9,2) END AS m2_smart,
+                  CASE WHEN (total_all/NULLIF(p1_total,0) BETWEEN 0.6 AND 1.67) THEN ROUND((local_smart_vol-p1_local)*price/1e9,2) END AS m0_local,
+                  CASE WHEN (total_all/NULLIF(p1_total,0) BETWEEN 0.6 AND 1.67) THEN ROUND((foreign_smart_vol-p1_foreign)*price/1e9,2) END AS m0_foreign,
+                  CASE WHEN (total_all/NULLIF(p1_total,0) BETWEEN 0.6 AND 1.67) THEN ROUND((retail_vol-p1_retail)*price/1e9,2) END AS m0_retail,
+                  ROUND(foreign_all/NULLIF(total_all,0)*100,2) AS foreign_own_pct,
+                  ROUND(local_all/NULLIF(total_all,0)*100,2) AS local_own_pct,
+                  ROUND(smart_vol/NULLIF(total_all,0)*100-p1_smart/NULLIF(p1_total,0)*100,3) AS smart_pct_delta
+              FROM base WHERE rn=1 AND p1_smart IS NOT NULL
+          ),
+          scored AS (
+              SELECT *, ROUND(COALESCE(m0_smart,0)+COALESCE(m1_smart,0)+COALESCE(m2_smart,0),2) AS cum3m_smart,
+                  CASE WHEN COALESCE(m0_smart,0)>0 AND COALESCE(m1_smart,0)>0 AND COALESCE(m2_smart,0)>0 THEN 'KONSISTEN_AKUMULASI'
+                       WHEN COALESCE(m0_smart,0)>0 THEN 'MULAI_AKUMULASI'
+                       WHEN COALESCE(m0_smart,0)<0 AND COALESCE(m1_smart,0)<0 AND COALESCE(m2_smart,0)<0 THEN 'KONSISTEN_DISTRIBUSI'
+                       WHEN COALESCE(m0_smart,0)<0 THEN 'MULAI_DISTRIBUSI' ELSE 'MIXED' END AS smart_money_trend,
+                  CASE WHEN COALESCE(m0_smart,0)>0 AND COALESCE(m0_retail,0)<0 THEN 'DIVERGEN_BULLISH'
+                       WHEN COALESCE(m0_smart,0)<0 AND COALESCE(m0_retail,0)>0 THEN 'DIVERGEN_BEARISH'
+                       ELSE 'ALIGNED' END AS divergence_signal,
+                  (CASE WHEN COALESCE(m0_smart,0)>0 THEN 1 ELSE 0 END+CASE WHEN COALESCE(m1_smart,0)>0 THEN 1 ELSE 0 END+CASE WHEN COALESCE(m2_smart,0)>0 THEN 1 ELSE 0 END) AS months_positive
+              FROM calc
+          )
+          SELECT s.stock_code, cp.sector, cp.group_name, s.price AS latest_price,
+              s.m0_smart, s.m1_smart, s.m2_smart, s.cum3m_smart,
+              s.m0_local, s.m0_foreign, s.m0_retail,
+              s.foreign_own_pct, s.local_own_pct, s.smart_pct_delta,
+              s.months_positive, s.Top_Buyer AS top_buyer, s.Top_Seller AS top_seller,
+              s.smart_money_trend, s.divergence_signal,
+              l.close::DOUBLE AS market_price, l.change_percent::DOUBLE AS change_pct,
+              CURRENT_TIMESTAMP AS refreshed_at
+          FROM scored s
+          LEFT JOIN market.company_profile cp ON s.stock_code=cp.stock_code
+          LEFT JOIN market.vw_stock_latest l ON s.stock_code=l.stock_code
+          WHERE ABS(COALESCE(s.m0_smart,0))>0.01
+          \"\"\")
+
+          print('Done. All 9 tables refreshed.')
+          con.close()
+          "
