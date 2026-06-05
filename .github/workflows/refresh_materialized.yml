@@ -38,9 +38,8 @@ jobs:
           refresh('market.tb_market_pulse',     'SELECT * FROM market.vw_d_market_pulse_tab')
           refresh('market.tb_radar',            'SELECT * FROM market.vw_watchlist_radar')
 
-          # 7: broker accumulation (90-day CTE from broker_activity)
-          refresh('market.tb_broker_accumulation', \"\"\"
-          WITH stock_agg AS (
+          # 7: broker accumulation — 5 multi-period tables (5d/14d/30d/60d/90d)
+          broker_sql = \"\"\"WITH stock_agg AS (
               SELECT LEFT(stock_code,4) AS clean_code,
                   SUM(CASE WHEN value>0 THEN value ELSE 0 END)::DOUBLE AS total_buy,
                   ABS(SUM(CASE WHEN value<0 THEN value ELSE 0 END))::DOUBLE AS total_sell,
@@ -50,33 +49,30 @@ jobs:
                   COUNT(DISTINCT CASE WHEN value>0 THEN broker_code END) AS buy_broker_count,
                   COUNT(DISTINCT CASE WHEN value<0 THEN broker_code END) AS sell_broker_count
               FROM main.broker_activity
-              WHERE CAST(date AS DATE) >= CURRENT_DATE - INTERVAL '90 days'
+              WHERE CAST(date AS DATE) >= CURRENT_DATE - __DAYS__
               GROUP BY LEFT(stock_code,4)
           ),
           top_buyer AS (
               SELECT LEFT(stock_code,4) AS clean_code, broker_code,
                   SUM(CASE WHEN value>0 THEN value ELSE 0 END)::DOUBLE AS buy_val,
                   ROW_NUMBER() OVER (PARTITION BY LEFT(stock_code,4) ORDER BY SUM(CASE WHEN value>0 THEN value ELSE 0 END) DESC) AS rn
-              FROM main.broker_activity
-              WHERE CAST(date AS DATE) >= CURRENT_DATE - INTERVAL '90 days'
+              FROM main.broker_activity WHERE CAST(date AS DATE) >= CURRENT_DATE - __DAYS__
               GROUP BY LEFT(stock_code,4), broker_code
           ),
           local_agg AS (
               SELECT LEFT(ba.stock_code,4) AS clean_code,
                   SUM(CASE WHEN ba.value>0 THEN ba.value ELSE 0 END)::DOUBLE AS local_buy,
                   SUM(ba.value)::DOUBLE AS local_net
-              FROM main.broker_activity ba
-              JOIN main.broker_classification bc ON bc.broker_code = ba.broker_code
-              WHERE CAST(ba.date AS DATE) >= CURRENT_DATE - INTERVAL '90 days' AND LOWER(bc.category) <> 'foreign'
+              FROM main.broker_activity ba JOIN main.broker_classification bc ON bc.broker_code = ba.broker_code
+              WHERE CAST(ba.date AS DATE) >= CURRENT_DATE - __DAYS__ AND LOWER(bc.category) <> 'foreign'
               GROUP BY LEFT(ba.stock_code,4)
           ),
           foreign_agg AS (
               SELECT LEFT(ba.stock_code,4) AS clean_code,
                   SUM(CASE WHEN ba.value>0 THEN ba.value ELSE 0 END)::DOUBLE AS foreign_buy,
                   SUM(ba.value)::DOUBLE AS foreign_net
-              FROM main.broker_activity ba
-              JOIN main.broker_classification bc ON bc.broker_code = ba.broker_code
-              WHERE CAST(ba.date AS DATE) >= CURRENT_DATE - INTERVAL '90 days' AND LOWER(bc.category) = 'foreign'
+              FROM main.broker_activity ba JOIN main.broker_classification bc ON bc.broker_code = ba.broker_code
+              WHERE CAST(ba.date AS DATE) >= CURRENT_DATE - __DAYS__ AND LOWER(bc.category) = 'foreign'
               GROUP BY LEFT(ba.stock_code,4)
           ),
           scored AS (
@@ -85,13 +81,10 @@ jobs:
                   ROUND(sa.total_sell / NULLIF(sa.total_buy, 0) * 100, 1)::DOUBLE AS sell_pressure_pct,
                   GREATEST(0.4, 1.0 - (sa.total_sell / NULLIF(sa.total_buy + sa.total_sell, 0)) * 0.6) AS sp_factor,
                   sa.net_accumulation / NULLIF(sa.total_value, 0) AS net_ratio,
-                  COALESCE(tb.buy_val, 0) AS top_buy_val,
-                  tb.broker_code AS top_buyer_code,
+                  COALESCE(tb.buy_val, 0) AS top_buy_val, tb.broker_code AS top_buyer_code,
                   ROUND(COALESCE(tb.buy_val,0)/NULLIF(sa.total_buy,0)*100,1)::DOUBLE AS top_buyer_pct,
-                  COALESCE(la.local_buy, 0) AS local_buy,
-                  COALESCE(la.local_net, 0) AS local_net,
-                  COALESCE(fa.foreign_buy, 0) AS foreign_buy,
-                  COALESCE(fa.foreign_net, 0) AS foreign_net,
+                  COALESCE(la.local_buy, 0) AS local_buy, COALESCE(la.local_net, 0) AS local_net,
+                  COALESCE(fa.foreign_buy, 0) AS foreign_buy, COALESCE(fa.foreign_net, 0) AS foreign_net,
                   ROUND(COALESCE(fa.foreign_buy,0)/NULLIF(sa.total_buy,0)*100,1)::DOUBLE AS foreign_buy_pct
               FROM stock_agg sa
               LEFT JOIN top_buyer tb ON sa.clean_code = tb.clean_code AND tb.rn = 1
@@ -112,8 +105,10 @@ jobs:
           FROM scored sc
           LEFT JOIN market.company_profile cp ON cp.stock_code = sc.clean_code
           LEFT JOIN market.vw_smart_money_score sms ON sms.stock_code = sc.clean_code
-          WHERE sc.net_accumulation > 0
-          \"\"\")
+          WHERE sc.net_accumulation > 0\"
+          for days in [5, 14, 30, 60, 90]:
+              sql = broker_sql.replace('__DAYS__', str(days))
+              refresh(f'market.tb_broker_accum_{days}d', sql)
 
           # 8: foreign multi-period screener (120-day from daily_transactions)
           refresh('market.tb_foreign_multiperiod', \"\"\"
