@@ -15,7 +15,7 @@ jobs:
           python-version: '3.11'
       - name: Install duckdb
         run: pip install duckdb==1.5.2
-      - name: Refresh all 9 materialized tables
+      - name: Refresh all 16 materialized tables
         env:
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
         run: |
@@ -39,11 +39,14 @@ jobs:
           refresh('market.tb_radar',            'SELECT * FROM market.vw_watchlist_radar')
 
           # 7: broker accumulation — 5 multi-period tables (5d/14d/30d/60d/90d)
+          # REBUILT: broker_activity is zero-sum at stock level (SUM(value)=0), so the old
+          # net_accumulation/net_ratio/LN(breadth) term was ~0 noise. Now ranks by SMART-broker
+          # net (FOREIGN + LOCAL_INST, non-zero-sum) x concentration. Concentration direction
+          # validated on 96d tape (A>B>C); absolute magnitude PENDING longer-history revalidation.
           broker_sql = \"\"\"WITH stock_agg AS (
               SELECT LEFT(stock_code,4) AS clean_code,
                   SUM(CASE WHEN value>0 THEN value ELSE 0 END)::DOUBLE AS total_buy,
                   ABS(SUM(CASE WHEN value<0 THEN value ELSE 0 END))::DOUBLE AS total_sell,
-                  SUM(value)::DOUBLE AS net_accumulation,
                   SUM(ABS(value))::DOUBLE AS total_value,
                   COUNT(DISTINCT broker_code) AS broker_count,
                   COUNT(DISTINCT CASE WHEN value>0 THEN broker_code END) AS buy_broker_count,
@@ -59,53 +62,83 @@ jobs:
               FROM main.broker_activity WHERE CAST(date AS DATE) >= CURRENT_DATE - __DAYS__
               GROUP BY LEFT(stock_code,4), broker_code
           ),
-          local_agg AS (
-              SELECT LEFT(ba.stock_code,4) AS clean_code,
-                  SUM(CASE WHEN ba.value>0 THEN ba.value ELSE 0 END)::DOUBLE AS local_buy,
-                  SUM(ba.value)::DOUBLE AS local_net
-              FROM main.broker_activity ba JOIN main.broker_classification bc ON bc.broker_code = ba.broker_code
-              WHERE CAST(ba.date AS DATE) >= CURRENT_DATE - __DAYS__ AND LOWER(bc.category) <> 'foreign'
-              GROUP BY LEFT(ba.stock_code,4)
-          ),
           foreign_agg AS (
               SELECT LEFT(ba.stock_code,4) AS clean_code,
                   SUM(CASE WHEN ba.value>0 THEN ba.value ELSE 0 END)::DOUBLE AS foreign_buy,
-                  SUM(ba.value)::DOUBLE AS foreign_net
+                  SUM(ba.value)::DOUBLE AS foreign_net,
+                  COUNT(DISTINCT ba.broker_code) AS foreign_brokers,
+                  COUNT(DISTINCT CASE WHEN ba.value>0 THEN ba.broker_code END) AS foreign_buy_brokers
               FROM main.broker_activity ba JOIN main.broker_classification bc ON bc.broker_code = ba.broker_code
-              WHERE CAST(ba.date AS DATE) >= CURRENT_DATE - __DAYS__ AND LOWER(bc.category) = 'foreign'
+              WHERE CAST(ba.date AS DATE) >= CURRENT_DATE - __DAYS__ AND UPPER(bc.category) = 'FOREIGN'
               GROUP BY LEFT(ba.stock_code,4)
           ),
+          inst_agg AS (
+              SELECT LEFT(ba.stock_code,4) AS clean_code,
+                  SUM(CASE WHEN ba.value>0 THEN ba.value ELSE 0 END)::DOUBLE AS inst_buy,
+                  SUM(ba.value)::DOUBLE AS inst_net,
+                  COUNT(DISTINCT ba.broker_code) AS inst_brokers,
+                  COUNT(DISTINCT CASE WHEN ba.value>0 THEN ba.broker_code END) AS inst_buy_brokers
+              FROM main.broker_activity ba JOIN main.broker_classification bc ON bc.broker_code = ba.broker_code
+              WHERE CAST(ba.date AS DATE) >= CURRENT_DATE - __DAYS__ AND UPPER(bc.category) = 'LOCAL_INST'
+              GROUP BY LEFT(ba.stock_code,4)
+          ),
+          top_smart AS (
+              SELECT clean_code, broker_code, buy_val,
+                  ROW_NUMBER() OVER (PARTITION BY clean_code ORDER BY buy_val DESC) AS rn
+              FROM (
+                  SELECT LEFT(ba.stock_code,4) AS clean_code, ba.broker_code,
+                      SUM(CASE WHEN ba.value>0 THEN ba.value ELSE 0 END)::DOUBLE AS buy_val
+                  FROM main.broker_activity ba JOIN main.broker_classification bc ON bc.broker_code = ba.broker_code
+                  WHERE CAST(ba.date AS DATE) >= CURRENT_DATE - __DAYS__ AND UPPER(bc.category) IN ('FOREIGN','LOCAL_INST')
+                  GROUP BY LEFT(ba.stock_code,4), ba.broker_code
+              ) x
+          ),
           scored AS (
-              SELECT sa.clean_code, sa.total_buy, sa.total_sell, sa.net_accumulation, sa.total_value,
+              SELECT sa.clean_code, sa.total_buy, sa.total_sell, sa.total_value,
                   sa.broker_count, sa.buy_broker_count, sa.sell_broker_count,
                   ROUND(sa.total_sell / NULLIF(sa.total_buy, 0) * 100, 1)::DOUBLE AS sell_pressure_pct,
-                  GREATEST(0.4, 1.0 - (sa.total_sell / NULLIF(sa.total_buy + sa.total_sell, 0)) * 0.6) AS sp_factor,
-                  sa.net_accumulation / NULLIF(sa.total_value, 0) AS net_ratio,
                   COALESCE(tb.buy_val, 0) AS top_buy_val, tb.broker_code AS top_buyer_code,
                   ROUND(COALESCE(tb.buy_val,0)/NULLIF(sa.total_buy,0)*100,1)::DOUBLE AS top_buyer_pct,
-                  COALESCE(la.local_buy, 0) AS local_buy, COALESCE(la.local_net, 0) AS local_net,
                   COALESCE(fa.foreign_buy, 0) AS foreign_buy, COALESCE(fa.foreign_net, 0) AS foreign_net,
+                  COALESCE(ia.inst_buy, 0) AS inst_buy, COALESCE(ia.inst_net, 0) AS inst_net,
+                  (COALESCE(fa.foreign_net,0) + COALESCE(ia.inst_net,0)) AS smart_net,
+                  (COALESCE(fa.foreign_buy,0) + COALESCE(ia.inst_buy,0)) AS smart_buy,
+                  (COALESCE(fa.foreign_brokers,0) + COALESCE(ia.inst_brokers,0)) AS smart_broker_count,
+                  (COALESCE(fa.foreign_buy_brokers,0) + COALESCE(ia.inst_buy_brokers,0)) AS smart_buy_brokers,
+                  COALESCE(ts.buy_val, 0) AS top_smart_buy_val, ts.broker_code AS top_smart_buyer_code,
                   ROUND(COALESCE(fa.foreign_buy,0)/NULLIF(sa.total_buy,0)*100,1)::DOUBLE AS foreign_buy_pct
               FROM stock_agg sa
               LEFT JOIN top_buyer tb ON sa.clean_code = tb.clean_code AND tb.rn = 1
-              LEFT JOIN local_agg la ON la.clean_code = sa.clean_code
               LEFT JOIN foreign_agg fa ON fa.clean_code = sa.clean_code
+              LEFT JOIN inst_agg ia ON ia.clean_code = sa.clean_code
+              LEFT JOIN top_smart ts ON ts.clean_code = sa.clean_code AND ts.rn = 1
           )
           SELECT sc.clean_code AS stock_code, cp.sector, cp.group_name AS company_name,
               sms.close::DOUBLE AS latest_price, sms.change_percent::DOUBLE AS price_change_pct,
-              sc.total_buy, sc.total_sell, sc.net_accumulation,
-              ROUND(sc.net_accumulation/1e9, 3)::DOUBLE AS net_miliar, sc.total_value,
-              sc.broker_count, sc.buy_broker_count, sc.sell_broker_count, sc.sell_pressure_pct,
+              sc.total_buy, sc.total_sell,
+              sc.smart_net AS net_accumulation,
+              ROUND(sc.smart_net/1e9, 3)::DOUBLE AS net_miliar,
+              ROUND(sc.smart_net/1e9, 3)::DOUBLE AS smart_net_miliar,
+              ROUND(sc.smart_buy/1e9, 3)::DOUBLE AS smart_buy_miliar,
+              sc.total_value, sc.broker_count, sc.buy_broker_count, sc.sell_broker_count, sc.sell_pressure_pct,
+              sc.smart_broker_count, sc.smart_buy_brokers,
               sc.top_buyer_code, sc.top_buyer_pct,
-              ROUND(sc.local_net/1e9, 3)::DOUBLE AS local_net_miliar,
+              sc.top_smart_buyer_code,
+              ROUND(sc.top_smart_buy_val / NULLIF(sc.smart_buy,0) * 100, 1)::DOUBLE AS smart_concentration_pct,
+              ROUND(sc.inst_net/1e9, 3)::DOUBLE AS local_net_miliar,
               ROUND(sc.foreign_net/1e9, 3)::DOUBLE AS foreign_net_miliar, sc.foreign_buy_pct,
               sms.whale_signal, sms.big_player_anomaly, sms.smart_money_score, sms.signal AS smart_signal,
-              ROUND(sc.net_ratio * LN(1 + sc.buy_broker_count) * 100 * sc.sp_factor + COALESCE(sms.smart_money_score, 0) * 0.3 + CASE WHEN sms.whale_signal THEN 8 ELSE 0 END + CASE WHEN sms.big_player_anomaly THEN 4 ELSE 0 END, 1)::DOUBLE AS composite_score,
+              ROUND(
+                  GREATEST(0, sc.smart_net/1e9)
+                  * (0.6 + 0.4 * LEAST(1.0, sc.top_smart_buy_val / NULLIF(sc.smart_buy,0)))
+                  * (1 + 0.20 * CASE WHEN sms.whale_signal THEN 1 ELSE 0 END
+                       + 0.10 * CASE WHEN sms.big_player_anomaly THEN 1 ELSE 0 END)
+              , 2)::DOUBLE AS composite_score,
               CURRENT_TIMESTAMP AS refreshed_at
           FROM scored sc
           LEFT JOIN market.company_profile cp ON cp.stock_code = sc.clean_code
           LEFT JOIN market.vw_smart_money_score sms ON sms.stock_code = sc.clean_code
-          WHERE sc.net_accumulation > 0\"\"\"
+          WHERE sc.smart_net > 0\"\"\"
           for days in [5, 14, 30, 60, 90]:
               sql = broker_sql.replace('__DAYS__', str(days))
               refresh(f'market.tb_broker_accum_{days}d', sql)
@@ -225,6 +258,152 @@ jobs:
           WHERE ABS(COALESCE(s.m0_smart,0))>0.01
           \"\"\")
 
-          print('Done. All 9 tables refreshed.')
+          # 14: signal validation — forward-return edge per signal
+          #     ANALYTICS ONLY — jangan di-join ke scoring live (memakai return masa depan)
+          refresh('market.tb_signal_validation', \"\"\"
+          WITH base AS (
+              SELECT stock_code, trading_date, value,
+                  whale_signal, big_player_anomaly,
+                  (aov_ratio_ma20 >= 1.5)      AS aov_ge_1p5,
+                  (aov_ratio_ma20 >= 2.0)      AS aov_ge_2p0,
+                  (aov_ratio_ma20 >= 3.0)      AS aov_ge_3p0,
+                  (close >= vwma_20d)          AS above_vwma,
+                  (signal = 'Akumulasi')       AS signal_akumulasi,
+                  (net_foreign_value > 0)      AS foreign_buy_day,
+                  (volume > ma20_volume * 1.5) AS vol_spike_1p5,
+                  (SUM(net_foreign_value) OVER (PARTITION BY stock_code ORDER BY trading_date ROWS BETWEEN 4 PRECEDING  AND CURRENT ROW) > 0) AS foreign_5d_pos,
+                  (SUM(net_foreign_value) OVER (PARTITION BY stock_code ORDER BY trading_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) > 0) AS foreign_20d_pos,
+                  (whale_signal AND net_foreign_value > 0)                          AS whale_x_foreign,
+                  (whale_signal AND close >= vwma_20d)                              AS whale_x_vwma,
+                  (whale_signal AND net_foreign_value > 0 AND close >= vwma_20d)     AS triple_confluence,
+                  (LEAD(close,5)  OVER (PARTITION BY stock_code ORDER BY trading_date) / NULLIF(close,0) - 1) * 100 AS fwd5,
+                  (LEAD(close,20) OVER (PARTITION BY stock_code ORDER BY trading_date) / NULLIF(close,0) - 1) * 100 AS fwd20
+              FROM market.daily_transactions
+              WHERE trading_date >= CURRENT_DATE - INTERVAL '730 days'
+          ),
+          filtered AS (
+              SELECT * FROM base WHERE fwd20 IS NOT NULL AND value >= 500000000
+          ),
+          long AS (
+                        SELECT fwd5, fwd20, 'whale_signal'        AS signal_name, whale_signal        AS is_on FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'big_player_anomaly', big_player_anomaly FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'aov_ge_1p5',         aov_ge_1p5         FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'aov_ge_2p0',         aov_ge_2p0         FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'aov_ge_3p0',         aov_ge_3p0         FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'above_vwma',         above_vwma         FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'signal_akumulasi',   signal_akumulasi   FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'foreign_buy_day',    foreign_buy_day    FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'vol_spike_1p5',      vol_spike_1p5      FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'whale_x_foreign',    whale_x_foreign    FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'whale_x_vwma',       whale_x_vwma       FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'triple_confluence',  triple_confluence  FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'foreign_5d_pos',     foreign_5d_pos     FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'foreign_20d_pos',    foreign_20d_pos    FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'aov3_x_foreign20',  (aov_ge_3p0 AND foreign_20d_pos) FROM filtered
+              UNION ALL SELECT fwd5, fwd20, 'aov3_x_vwma',       (aov_ge_3p0 AND above_vwma)      FROM filtered
+          )
+          SELECT signal_name,
+              COUNT(*) FILTER (WHERE is_on) AS n_signal,
+              ROUND(AVG(fwd20)    FILTER (WHERE is_on), 2) AS avg_ret_20d_on,
+              ROUND(MEDIAN(fwd20) FILTER (WHERE is_on), 2) AS median_20d_on,
+              ROUND(AVG(fwd5)     FILTER (WHERE is_on), 2) AS avg_ret_5d_on,
+              ROUND(AVG(CASE WHEN fwd20 > 0 THEN 1.0 ELSE 0 END) FILTER (WHERE is_on) * 100, 1) AS hit_20d_on,
+              ROUND(AVG(fwd20)    FILTER (WHERE NOT is_on), 2) AS avg_ret_20d_off,
+              ROUND(AVG(CASE WHEN fwd20 > 0 THEN 1.0 ELSE 0 END) FILTER (WHERE NOT is_on) * 100, 1) AS hit_20d_off,
+              ROUND(AVG(fwd20) FILTER (WHERE is_on) - AVG(fwd20) FILTER (WHERE NOT is_on), 2) AS edge_20d,
+              ROUND(AVG(CASE WHEN fwd20>0 THEN 1.0 ELSE 0 END) FILTER (WHERE is_on)*100
+                  - AVG(CASE WHEN fwd20>0 THEN 1.0 ELSE 0 END) FILTER (WHERE NOT is_on)*100, 1) AS edge_hit_20d,
+              CURRENT_TIMESTAMP AS refreshed_at
+          FROM long
+          GROUP BY signal_name
+          ORDER BY edge_20d DESC
+          \"\"\")
+
+          # 15: score calibration — percentile thresholds so tier labels track actual distribution
+          refresh('market.tb_score_calibration', \"\"\"
+          SELECT metric,
+              ROUND(approx_quantile(score, 0.50), 1) AS p50,
+              ROUND(approx_quantile(score, 0.75), 1) AS p75,
+              ROUND(approx_quantile(score, 0.85), 1) AS p85,
+              ROUND(approx_quantile(score, 0.95), 1) AS p95,
+              ROUND(approx_quantile(score, 0.99), 1) AS p99,
+              ROUND(MAX(score), 1) AS max_obs,
+              COUNT(*) AS n,
+              CURRENT_TIMESTAMP AS refreshed_at
+          FROM (
+                        SELECT 'composite_score'     AS metric, composite_score::DOUBLE     AS score FROM market.vw_c_composite_score
+              UNION ALL SELECT 'daily_trigger_score',          daily_trigger_score::DOUBLE          FROM market.vw_c_composite_score
+              UNION ALL SELECT 'radar_score',                  radar_score::DOUBLE                  FROM market.vw_watchlist_radar
+              UNION ALL SELECT 'smart_money_score',            smart_money_score::DOUBLE            FROM market.vw_smart_money_score
+          )
+          GROUP BY metric
+          \"\"\")
+
+          # 16: composite v2 — evidence-weighted score (AOV graduated + VWMA + whale + foreign filter)
+          #     validated: top-1% fwd-20d ~16% pooled; robust OOS (H1 11.7% / H2 18.4%). Absolute cutoffs from trailing 730d.
+          refresh('market.tb_composite_v2', \"\"\"
+          WITH latest AS (SELECT max(trading_date) AS d FROM market.daily_transactions),
+          hist_roll AS (
+              SELECT value, aov_ratio_ma20, close, vwma_20d, whale_signal, big_player_anomaly,
+                  SUM(net_foreign_value) OVER (PARTITION BY stock_code ORDER BY trading_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS f20
+              FROM market.daily_transactions
+              WHERE trading_date >= (SELECT d FROM latest) - INTERVAL '730 days'
+          ),
+          hist AS (
+              SELECT (CASE WHEN value < 500000000 THEN 0 WHEN aov_ratio_ma20 >= 3.0 THEN 40
+                           WHEN aov_ratio_ma20 >= 2.0 THEN 25 WHEN aov_ratio_ma20 >= 1.5 THEN 14 ELSE 0 END)
+                   + (CASE WHEN close >= vwma_20d*1.03 THEN 15 WHEN close >= vwma_20d THEN 8 ELSE 0 END)
+                   + (CASE WHEN big_player_anomaly THEN 12 WHEN whale_signal THEN 8 ELSE 0 END)
+                   + (CASE WHEN f20 > 0 AND aov_ratio_ma20 >= 2.0 THEN 6 WHEN f20 > 0 THEN 2 ELSE 0 END) AS v2_score
+              FROM hist_roll WHERE value >= 500000000
+          ),
+          cutoffs AS (
+              SELECT approx_quantile(v2_score,0.85) AS c85, approx_quantile(v2_score,0.95) AS c95, approx_quantile(v2_score,0.99) AS c99 FROM hist
+          ),
+          roll AS (
+              SELECT stock_code, trading_date, close, change_percent, value, aov_ratio_ma20, vwma_20d, whale_signal, big_player_anomaly,
+                  SUM(net_foreign_value) OVER (PARTITION BY stock_code ORDER BY trading_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS f20
+              FROM market.daily_transactions
+              WHERE trading_date >= (SELECT d FROM latest) - INTERVAL '40 days'
+          ),
+          scored AS (
+              SELECT s.stock_code, s.close, s.change_percent, s.aov_ratio_ma20, s.vwma_20d, s.whale_signal, s.big_player_anomaly,
+                  ROUND(s.f20/1e9,3) AS foreign_20d_miliar,
+                  (CASE WHEN s.aov_ratio_ma20 >= 3.0 THEN 40 WHEN s.aov_ratio_ma20 >= 2.0 THEN 25 WHEN s.aov_ratio_ma20 >= 1.5 THEN 14 ELSE 0 END) AS aov_pts,
+                  (CASE WHEN s.close >= s.vwma_20d*1.03 THEN 15 WHEN s.close >= s.vwma_20d THEN 8 ELSE 0 END) AS vwma_pts,
+                  (CASE WHEN s.big_player_anomaly THEN 12 WHEN s.whale_signal THEN 8 ELSE 0 END) AS whale_pts,
+                  (CASE WHEN s.f20 > 0 AND s.aov_ratio_ma20 >= 2.0 THEN 6 WHEN s.f20 > 0 THEN 2 ELSE 0 END) AS foreign_pts
+              FROM roll s WHERE s.trading_date = (SELECT d FROM latest) AND s.value >= 500000000
+          )
+          SELECT sc.stock_code, COALESCE(cp.sector,'Others') AS sector, COALESCE(cp.group_name,'Others') AS group_name,
+              sc.close, sc.change_percent, ph.return_5d, ph.return_20d,
+              sc.aov_ratio_ma20, sc.foreign_20d_miliar, sc.whale_signal, sc.big_player_anomaly,
+              sc.aov_pts, sc.vwma_pts, sc.whale_pts, sc.foreign_pts,
+              (sc.aov_pts + sc.vwma_pts + sc.whale_pts + sc.foreign_pts) AS v2_score,
+              CASE WHEN (sc.aov_pts+sc.vwma_pts+sc.whale_pts+sc.foreign_pts) >= co.c99 THEN 'STRONG_BUY'
+                   WHEN (sc.aov_pts+sc.vwma_pts+sc.whale_pts+sc.foreign_pts) >= co.c95 THEN 'BUY'
+                   WHEN (sc.aov_pts+sc.vwma_pts+sc.whale_pts+sc.foreign_pts) >= co.c85 THEN 'ACCUMULATE'
+                   WHEN (sc.aov_pts+sc.vwma_pts+sc.whale_pts+sc.foreign_pts) > 0 THEN 'WATCH'
+                   ELSE 'NEUTRAL' END AS tier_v2,
+              CASE WHEN sc.change_percent > 2 AND sc.close >= sc.vwma_20d THEN 'MOMENTUM_UP'
+                   WHEN sc.change_percent > 2 THEN 'BREAKOUT_ATTEMPT'
+                   WHEN sc.change_percent <= -3 AND (sc.aov_ratio_ma20 >= 1.5 OR sc.whale_signal OR sc.big_player_anomaly) THEN 'ACCUM_ON_WEAKNESS'
+                   WHEN sc.change_percent <= -3 THEN 'DOWNTREND'
+                   WHEN sc.close >= sc.vwma_20d THEN 'HOLDING_ABOVE_VWMA'
+                   ELSE 'CONSOLIDATING' END AS flow_context,
+              COALESCE(cs.ksei_score,0) AS ksei_score_ctx, COALESCE(cs.insider_score,0) AS insider_score_ctx,
+              cs.composite_score AS v1_composite_score,
+              ROW_NUMBER() OVER (ORDER BY (sc.aov_pts+sc.vwma_pts+sc.whale_pts+sc.foreign_pts) DESC) AS rank_overall,
+              co.c85, co.c95, co.c99,
+              (SELECT d FROM latest) AS as_of_date, CURRENT_TIMESTAMP AS refreshed_at
+          FROM scored sc
+          CROSS JOIN cutoffs co
+          LEFT JOIN market.company_profile cp ON cp.stock_code = sc.stock_code
+          LEFT JOIN market.vw_f_price_history ph ON ph.stock_code = sc.stock_code AND ph.trading_date = (SELECT d FROM latest)
+          LEFT JOIN market.vw_c_composite_score cs ON cs.stock_code = sc.stock_code
+          ORDER BY v2_score DESC
+          \"\"\")
+
+          print('Done. All 16 tables refreshed.')
           con.close()
           "
