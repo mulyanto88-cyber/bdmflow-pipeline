@@ -2,7 +2,7 @@ name: 🚀 Daily Stock Pipeline
 
 on:
   schedule:
-    - cron: '0 10 * * 1-5'  # 17:00 WIB, Senin-Jumat
+    - cron: '30 11 * * 1-5'  # 18:30 WIB, Senin-Jumat
   workflow_dispatch:
 
 jobs:
@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
