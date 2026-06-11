@@ -5,10 +5,14 @@ on:
     - cron: '50 12 * * 1-5'  # 19:50 WIB, Senin-Jumat
   workflow_dispatch:
 
+concurrency:
+  group: refresh-materialized
+  cancel-in-progress: false
+
 jobs:
   refresh-all:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -18,6 +22,7 @@ jobs:
       - name: Refresh all 16 materialized tables
         env:
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          PYTHONUNBUFFERED: "1"
         run: |
           python -c "
           import duckdb, os, time
