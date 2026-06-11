@@ -119,7 +119,7 @@ def get_existing_dates(con, table):
             f"SELECT DISTINCT CAST(date AS VARCHAR) FROM {table}"
         ).fetchall()
         return set(r[0] for r in rows)
-    except:
+    except Exception:
         return set()
 
 # =============================================================================
@@ -155,7 +155,7 @@ def get_broker_activity(headers, broker_code, target_date):
         all_sells.extend(sells)
         if len(buys) < ACTIVITY_LIMIT and len(sells) < ACTIVITY_LIMIT:
             break
-        time.sleep(1.0 + random.uniform(0.3, 0.9))
+        time.sleep(0.7 + random.uniform(0.2, 0.5))
     return all_buys, all_sells
 
 def normalize_broker(stock, broker_code, broker_name, side, default_date):
@@ -225,7 +225,7 @@ def fetch_insider_for_date(headers, target_date):
             if not data.get('is_more', False):
                 break
             page += 1
-            time.sleep(1.0 + random.uniform(0.3, 0.7))
+            time.sleep(0.5 + random.uniform(0.2, 0.4))
         except Exception as e:
             print(f"   ⚠️ Error insider page {page}: {str(e)[:60]}")
             break
@@ -302,7 +302,7 @@ def main():
                     except Exception as e:
                         if '401' in str(e) or '403' in str(e):
                             raise
-                    time.sleep(1.0 + random.uniform(0.5, 1.5))
+                    time.sleep(0.8 + random.uniform(0.2, 0.6))
 
                 if rows_today:
                     df_today = pd.DataFrame(rows_today, columns=COLS_BROKER)
