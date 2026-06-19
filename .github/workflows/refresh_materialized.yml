@@ -43,6 +43,12 @@ jobs:
           refresh('market.tb_market_pulse',     'SELECT * FROM market.vw_d_market_pulse_tab')
           refresh('market.tb_radar',            'SELECT * FROM market.vw_watchlist_radar')
 
+          # 1.2 (app perf): snapshot hot live views so API routes read precomputed tables instead of
+          # recomputing the view per request. Refresh from base tables only (no tb_ dependency).
+          refresh('market.tb_stock_latest',       'SELECT * FROM market.vw_stock_latest')
+          refresh('market.tb_smart_money_score',  'SELECT * FROM market.vw_smart_money_score')
+          refresh('main.tb_broker_rolling_net',   'SELECT * FROM main.vw_broker_rolling_net')
+
           # 7: broker accumulation — 5 multi-period tables (5d/14d/30d/60d/90d)
           # REBUILT: broker_activity is zero-sum at stock level (SUM(value)=0), so the old
           # net_accumulation/net_ratio/LN(breadth) term was ~0 noise. Now ranks by SMART-broker
