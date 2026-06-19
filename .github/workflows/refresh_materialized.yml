@@ -150,34 +150,41 @@ jobs:
 
           # 8: foreign multi-period screener (120-day from daily_transactions)
           refresh('market.tb_foreign_multiperiod', \"\"\"
-          WITH mp AS (
-              SELECT dt.stock_code,
-                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '1 day'   THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f1d,
-                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '7 days'  THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f7d,
-                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '14 days' THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f14d,
-                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '30 days' THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f30d,
-                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '60 days' THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f60d,
-                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '90 days' THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f90d,
-                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '120 days'THEN dt.net_foreign_value ELSE 0 END)::DOUBLE AS f120d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '1 day'   AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_1d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '1 day'   AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_1d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '7 days'  AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_7d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '7 days'  AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_7d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '14 days' AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_14d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '14 days' AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_14d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '30 days' AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_30d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '30 days' AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_30d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '60 days' AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_60d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '60 days' AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_60d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '90 days' AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_90d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '90 days' AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_90d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '120 days'AND dt.net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_120d,
-                  COUNT(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '120 days'AND dt.net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_120d,
-                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '120 days' THEN dt.foreign_buy_value  ELSE 0 END)::DOUBLE AS buy120d,
-                  SUM(CASE WHEN dt.trading_date >= CURRENT_DATE - INTERVAL '120 days' THEN dt.foreign_sell_value ELSE 0 END)::DOUBLE AS sell120d
-              FROM market.daily_transactions dt
-              WHERE dt.trading_date >= CURRENT_DATE - INTERVAL '120 days'
-              GROUP BY dt.stock_code
+          WITH ranked AS (
+              -- rank each stock's trading days (rn=1 = latest actual trading day, anchored to data not CURRENT_DATE)
+              SELECT stock_code, net_foreign_value, foreign_buy_value, foreign_sell_value,
+                  ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY trading_date DESC) AS rn
+              FROM market.daily_transactions
+              WHERE trading_date >= CURRENT_DATE - INTERVAL '250 days'
+          ),
+          mp AS (
+              -- periods are TRADING-DAY windows: f7d = 7 most recent trading days, etc.
+              SELECT stock_code,
+                  SUM(CASE WHEN rn <= 1   THEN net_foreign_value ELSE 0 END)::DOUBLE AS f1d,
+                  SUM(CASE WHEN rn <= 7   THEN net_foreign_value ELSE 0 END)::DOUBLE AS f7d,
+                  SUM(CASE WHEN rn <= 14  THEN net_foreign_value ELSE 0 END)::DOUBLE AS f14d,
+                  SUM(CASE WHEN rn <= 30  THEN net_foreign_value ELSE 0 END)::DOUBLE AS f30d,
+                  SUM(CASE WHEN rn <= 60  THEN net_foreign_value ELSE 0 END)::DOUBLE AS f60d,
+                  SUM(CASE WHEN rn <= 90  THEN net_foreign_value ELSE 0 END)::DOUBLE AS f90d,
+                  SUM(CASE WHEN rn <= 120 THEN net_foreign_value ELSE 0 END)::DOUBLE AS f120d,
+                  COUNT(CASE WHEN rn <= 1   AND net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_1d,
+                  COUNT(CASE WHEN rn <= 1   AND net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_1d,
+                  COUNT(CASE WHEN rn <= 7   AND net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_7d,
+                  COUNT(CASE WHEN rn <= 7   AND net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_7d,
+                  COUNT(CASE WHEN rn <= 14  AND net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_14d,
+                  COUNT(CASE WHEN rn <= 14  AND net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_14d,
+                  COUNT(CASE WHEN rn <= 30  AND net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_30d,
+                  COUNT(CASE WHEN rn <= 30  AND net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_30d,
+                  COUNT(CASE WHEN rn <= 60  AND net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_60d,
+                  COUNT(CASE WHEN rn <= 60  AND net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_60d,
+                  COUNT(CASE WHEN rn <= 90  AND net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_90d,
+                  COUNT(CASE WHEN rn <= 90  AND net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_90d,
+                  COUNT(CASE WHEN rn <= 120 AND net_foreign_value > 0 THEN 1 END)::BIGINT AS buy_days_120d,
+                  COUNT(CASE WHEN rn <= 120 AND net_foreign_value < 0 THEN 1 END)::BIGINT AS sell_days_120d,
+                  SUM(CASE WHEN rn <= 120 THEN foreign_buy_value  ELSE 0 END)::DOUBLE AS buy120d,
+                  SUM(CASE WHEN rn <= 120 THEN foreign_sell_value ELSE 0 END)::DOUBLE AS sell120d
+              FROM ranked
+              GROUP BY stock_code
           )
           SELECT mp.stock_code, cp.group_name AS company_name, cp.sector,
               sl.close::DOUBLE AS close, sl.change_percent::DOUBLE AS change_percent,
