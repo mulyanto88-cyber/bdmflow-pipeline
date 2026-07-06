@@ -183,7 +183,7 @@ def save_backup(df, service):
     df.to_csv(buf, index=False)
     media = MediaIoBaseUpload(
         io.BytesIO(buf.getvalue().encode('utf-8')),
-        mimetype='text/csv', resumable=True)
+        mimetype='text/csv', resumable=False)
     query = f"'{FOLDER_BACKUP_ID}' in parents and name='{BACKUP_CSV_NAME}' and trashed=false"
     old   = service.files().list(q=query, fields="files(id)").execute().get('files',[])
     if old:
