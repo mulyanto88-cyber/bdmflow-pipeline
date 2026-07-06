@@ -138,6 +138,8 @@ def process_excel(file_path, filename):
             'SHARECODE': 'SHARE_CODE',
             'ISSUERNAME': 'ISSUER_NAME',
             'INVESTORNAME': 'INVESTOR_NAME',
+            'INVESTOR_CLASSIFICATION': 'INVESTOR_TYPE',
+            'INVESTORCLASSIFICATION': 'INVESTOR_TYPE',
             'INVESTORTYPE': 'INVESTOR_TYPE',
             'LOCALFOREIGN': 'LOCAL_FOREIGN',
             'HOLDINGSSCRIPLESS': 'HOLDINGS_SCRIPLESS',
@@ -262,6 +264,50 @@ def main():
     for col in ['data_source', 'share_code', 'issuer_name', 'investor_name', 'investor_type', 'local_foreign', 'nationality', 'domicile']:
         if col in df_md.columns:
             df_md[col] = df_md[col].astype(str).str.strip()
+
+    # Standardize local_foreign values (L/D -> L, F/A -> F)
+    if 'local_foreign' in df_md.columns:
+        df_md['local_foreign'] = df_md['local_foreign'].str.upper().replace({
+            'A': 'F',
+            'ASING': 'F',
+            'FOREIGN': 'F',
+            'L': 'L',
+            'LOKAL': 'L',
+            'LOCAL': 'L',
+            'D': 'L',
+            'DOMESTIK': 'L',
+            '': 'L'
+        })
+
+    # Standardize investor_type values (short codes -> full words)
+    if 'investor_type' in df_md.columns:
+        df_md['investor_type'] = df_md['investor_type'].str.upper().replace({
+            'CP': 'Corporate',
+            'CORPORATE': 'Corporate',
+            'ID': 'Individual',
+            'INDIVIDUAL': 'Individual',
+            'MF': 'Fund Manager',
+            'MUTUAL FUNDS': 'Fund Manager',
+            'MUTUAL FUND': 'Fund Manager',
+            'FUND MANAGER': 'Fund Manager',
+            'IB': 'Financial Institutional',
+            'BANK': 'Financial Institutional',
+            'FINANCIAL INSTITUTIONAL': 'Financial Institutional',
+            'IS': 'Insurance',
+            'INSURANCE': 'Insurance',
+            'PF': 'Pension Fund',
+            'PENSION FUNDS': 'Pension Fund',
+            'PENSION FUND': 'Pension Fund',
+            'SC': 'Securities',
+            'SECURITIES COMPANY': 'Securities',
+            'SECURITIES': 'Securities',
+            'FD': 'Others',
+            'FOUNDATION': 'Others',
+            'OT': 'Others',
+            'OTHERS': 'Others',
+            '': 'Others',
+            'NAN': 'Others'
+        })
             
     # Handle multiple date formatting (e.g. YYYY-MM-DD or DD/MM/YYYY)
     df_md['date'] = pd.to_datetime(df_md['date'], errors='coerce').dt.date
@@ -280,6 +326,109 @@ def main():
     con.register("temp_ksei1", df_md)
     con.execute("DROP TABLE IF EXISTS ksei.ownership_1pct")
     con.execute("CREATE TABLE ksei.ownership_1pct AS SELECT * FROM temp_ksei1")
+
+    # Recreate SQL views for compatibility and robust calculations
+    print("   🦆 Recreating database views...")
+    con.execute("""
+    CREATE OR REPLACE VIEW ksei.vw_ksei_individual_changes AS 
+    WITH latest_date AS (
+        SELECT CAST(max(date) AS DATE) AS max_date FROM ksei.ownership_1pct
+    ), 
+    individual_changes AS (
+        SELECT o.date, o.share_code, o.investor_name, o.investor_type, o.nationality, o.percentage, o.total_holding_shares, 
+               lag(o.percentage) OVER (PARTITION BY o.share_code, o.investor_name ORDER BY o.date) AS prev_percentage, 
+               lag(o.total_holding_shares) OVER (PARTITION BY o.share_code, o.investor_name ORDER BY o.date) AS prev_shares 
+        FROM ksei.ownership_1pct AS o 
+        CROSS JOIN latest_date AS l 
+        WHERE (o.investor_type IN ('ID', 'Individual')) 
+          AND (CAST(o.date AS DATE) >= (l.max_date - INTERVAL '3 months'))
+    )
+    SELECT 
+        CAST(date AS DATE) AS report_date, 
+        share_code, 
+        investor_name, 
+        investor_type, 
+        nationality, 
+        COALESCE(prev_percentage, percentage) AS prev_percentage, 
+        percentage AS curr_percentage, 
+        round((percentage - COALESCE(prev_percentage, percentage)), 4) AS pct_point_change, 
+        (total_holding_shares - COALESCE(prev_shares, total_holding_shares)) AS share_change, 
+        CASE  
+            WHEN (total_holding_shares > COALESCE(prev_shares, total_holding_shares)) THEN 'BUYING' 
+            WHEN (total_holding_shares < COALESCE(prev_shares, total_holding_shares)) THEN 'SELLING' 
+            ELSE 'HOLDING' 
+        END AS action, 
+        CASE  
+            WHEN (abs((percentage - COALESCE(prev_percentage, percentage))) >= 2.0) THEN 'HIGH' 
+            WHEN (abs((percentage - COALESCE(prev_percentage, percentage))) >= 1.0) THEN 'MEDIUM' 
+            ELSE 'LOW' 
+        END AS alert_level 
+    FROM individual_changes 
+    WHERE (prev_percentage IS NOT NULL) 
+      AND (abs((percentage - COALESCE(prev_percentage, percentage))) >= 0.3) 
+    ORDER BY abs((percentage - COALESCE(prev_percentage, percentage))) DESC;
+    """)
+
+    con.execute("""
+    CREATE OR REPLACE VIEW ksei.vw_insider_screener AS 
+    WITH latest_date AS (
+        SELECT max(CAST(date AS DATE)) AS curr_date FROM ksei.ownership_1pct
+    ), 
+    prev_date AS (
+        SELECT max(CAST(date AS DATE)) AS prev_date 
+        FROM ksei.ownership_1pct 
+        WHERE (CAST(date AS DATE) < (SELECT curr_date FROM latest_date))
+    ), 
+    current_data AS (
+        SELECT o.share_code, o.investor_name, o.investor_type, o.local_foreign, o.percentage AS curr_pct, o.total_holding_shares AS curr_shares 
+        FROM ksei.ownership_1pct AS o, latest_date AS l 
+        WHERE (CAST(o.date AS DATE) = l.curr_date)
+    ), 
+    previous_data AS (
+        SELECT o.share_code, o.investor_name, o.percentage AS prev_pct, o.total_holding_shares AS prev_shares 
+        FROM ksei.ownership_1pct AS o, prev_date AS p 
+        WHERE (CAST(o.date AS DATE) = p.prev_date)
+    ), 
+    stock_aggregate AS (
+        SELECT 
+            c.share_code, 
+            sum(CASE WHEN c.investor_type IN ('CP', 'Corporate') THEN c.curr_pct ELSE 0 END) AS corp_curr, 
+            sum(CASE WHEN c.local_foreign IN ('F', 'A') THEN c.curr_pct ELSE 0 END) AS foreign_curr, 
+            sum(CASE WHEN c.investor_type IN ('ID', 'Individual') THEN c.curr_pct ELSE 0 END) AS ind_curr, 
+            sum(CASE WHEN c.investor_type IN ('MF', 'Mutual Funds', 'Fund Manager') THEN c.curr_pct ELSE 0 END) AS fund_curr, 
+            sum(CASE WHEN c.investor_type IN ('IB', 'Bank', 'Financial Institutional') THEN c.curr_pct ELSE 0 END) AS fin_curr, 
+            COALESCE(sum(CASE WHEN (p.investor_name IS NOT NULL AND c.investor_type IN ('CP', 'Corporate')) THEN p.prev_pct ELSE 0 END), 0) AS corp_prev, 
+            COALESCE(sum(CASE WHEN (p.investor_name IS NOT NULL AND c.local_foreign IN ('F', 'A')) THEN p.prev_pct ELSE 0 END), 0) AS foreign_prev, 
+            COALESCE(sum(CASE WHEN (p.investor_name IS NOT NULL AND c.investor_type IN ('ID', 'Individual')) THEN p.prev_pct ELSE 0 END), 0) AS ind_prev 
+        FROM current_data AS c 
+        LEFT JOIN previous_data AS p ON (c.share_code = p.share_code AND c.investor_name = p.investor_name) 
+        GROUP BY c.share_code
+    )
+    SELECT 
+        sa.share_code AS code, 
+        (sa.corp_curr - sa.corp_prev) AS corp_change, 
+        (sa.foreign_curr - sa.foreign_prev) AS foreign_change, 
+        (sa.ind_curr - sa.ind_prev) AS ind_change, 
+        (
+            (CASE WHEN ((sa.corp_curr - sa.corp_prev) > 1 AND (sa.ind_curr - sa.ind_prev) < -0.5) THEN 3 ELSE 0 END) + 
+            (CASE WHEN ((sa.foreign_curr - sa.foreign_prev) > 1) THEN 2 ELSE 0 END) + 
+            (CASE WHEN (((sa.corp_curr + sa.fund_curr) + sa.fin_curr) > 50) THEN 1 ELSE 0 END) + 
+            (CASE WHEN ((sa.corp_curr - sa.corp_prev) < -1 AND (sa.ind_curr - sa.ind_prev) > 0.5) THEN -2 ELSE 0 END) + 
+            (CASE WHEN ((sa.foreign_curr - sa.foreign_prev) < -1) THEN -2 ELSE 0 END) + 
+            (CASE WHEN ((sa.ind_curr - sa.ind_prev) > 1) THEN 1 ELSE 0 END)
+        ) AS score, 
+        concat_ws(', ', 
+            CASE WHEN ((sa.corp_curr - sa.corp_prev) > 1 AND (sa.ind_curr - sa.ind_prev) < -0.5) THEN '🟢 Corp Acc' ELSE NULL END, 
+            CASE WHEN ((sa.foreign_curr - sa.foreign_prev) > 1) THEN '🟢 Foreign In' ELSE NULL END, 
+            CASE WHEN (((sa.corp_curr + sa.fund_curr) + sa.fin_curr) > 50) THEN '💎 Inst Dom' ELSE NULL END, 
+            CASE WHEN ((sa.corp_curr - sa.corp_prev) < -1 AND (sa.ind_curr - sa.ind_prev) > 0.5) THEN '🔴 Corp Dist' ELSE NULL END, 
+            CASE WHEN ((sa.foreign_curr - sa.foreign_prev) < -1) THEN '🔴 Foreign Out' ELSE NULL END, 
+            CASE WHEN ((sa.ind_curr - sa.ind_prev) > 1) THEN '🟡 Insider Buy' ELSE NULL END
+        ) AS signals 
+    FROM stock_aggregate AS sa 
+    WHERE (abs((sa.corp_curr - sa.corp_prev)) >= 0.1 OR abs((sa.foreign_curr - sa.foreign_prev)) >= 0.1 OR abs((sa.ind_curr - sa.ind_prev)) >= 0.1) 
+    ORDER BY score DESC;
+    """)
 
     count = con.execute("SELECT COUNT(*) FROM ksei.ownership_1pct").fetchone()[0]
     dates = con.execute("SELECT COUNT(DISTINCT date) FROM ksei.ownership_1pct").fetchone()[0]
