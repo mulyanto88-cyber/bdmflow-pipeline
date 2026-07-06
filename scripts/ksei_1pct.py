@@ -258,6 +258,11 @@ def main():
     df_md = df_final.copy()
     df_md.columns = [c.lower().replace(' ', '_') for c in df_md.columns]
     
+    # Force string columns to VARCHAR/object in pandas to avoid mixed-type scanner crashes in DuckDB
+    for col in ['data_source', 'share_code', 'issuer_name', 'investor_name', 'investor_type', 'local_foreign', 'nationality', 'domicile']:
+        if col in df_md.columns:
+            df_md[col] = df_md[col].astype(str).str.strip()
+            
     # Handle multiple date formatting (e.g. YYYY-MM-DD or DD/MM/YYYY)
     df_md['date'] = pd.to_datetime(df_md['date'], errors='coerce').dt.date
     df_md = df_md.dropna(subset=['date'])
