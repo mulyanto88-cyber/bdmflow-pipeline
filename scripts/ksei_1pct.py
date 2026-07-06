@@ -100,11 +100,30 @@ def clean_numeric_safe(df, columns, is_float=False):
             else:
                 # If it's a string, clean it safely
                 s = df[col].astype(str).str.strip().str.replace(r'\s+','',regex=True)
+                s = s.str.replace('%', '', regex=False)
+                
                 if is_float:
-                    s = s.str.replace('.','',regex=False).str.replace(',','.',regex=False)
+                    def parse_single_float(val_str):
+                        if not val_str or val_str.lower() in ['nan', 'none', '']:
+                            return 0.0
+                        # If there are both comma and dot, e.g., 1,234.56 or 1.234,56
+                        if ',' in val_str and '.' in val_str:
+                            if val_str.find(',') < val_str.find('.'):
+                                val_str = val_str.replace(',', '')  # English format
+                            else:
+                                val_str = val_str.replace('.', '').replace(',', '.')  # Indonesian format
+                        elif ',' in val_str:
+                            # Only comma is present, e.g., 79,31
+                            val_str = val_str.replace(',', '.')
+                        try:
+                            return float(val_str)
+                        except:
+                            return 0.0
+                    df[col] = s.apply(parse_single_float)
                 else:
+                    # For integer, remove dots and commas completely
                     s = s.str.replace('.','',regex=False).str.replace(',','',regex=False)
-                df[col] = pd.to_numeric(s, errors='coerce').fillna(0)
+                    df[col] = pd.to_numeric(s, errors='coerce').fillna(0)
             
             if is_float:
                 df[col] = df[col].astype('float64')
