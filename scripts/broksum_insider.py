@@ -29,7 +29,7 @@ INSIDER_LIMIT    = 50
 INSIDER_MAX_PAGES= 200
 PERIOD           = 'TB_PERIOD_LAST_1_DAY'
 
-DEFAULT_DAYS_BACK_BROKER  = 500
+DEFAULT_DAYS_BACK_BROKER  = 300
 DEFAULT_DAYS_BACK_INSIDER = 30
 
 # =============================================================================
