@@ -204,59 +204,58 @@ def main():
             
     print(f"📄 {len(all_files)} total | {len(new_files)} baru")
 
-    if not new_files:
-        print("✅ Semua file sudah diproses.")
-        return
-
     EXPECTED_COLS = [
         'DATE','SHARE_CODE','ISSUER_NAME','INVESTOR_NAME','INVESTOR_TYPE',
         'LOCAL_FOREIGN','NATIONALITY','DOMICILE','HOLDINGS_SCRIPLESS',
         'HOLDINGS_SCRIP','TOTAL_HOLDING_SHARES','PERCENTAGE'
     ]
 
-    all_new = []
-    for f_info in tqdm(new_files, desc="Processing files"):
-        local_path = os.path.join(TEMP_DIR, f_info['name'])
-        download_file(service, f_info['id'], f_info['mimeType'], local_path)
-        df_temp = process_excel(local_path, f_info['name'])
-        if df_temp is not None and not df_temp.empty:
-            # Map column names to EXPECTED_COLS in order, filling missing ones with default values
-            df_target = pd.DataFrame()
-            for col in EXPECTED_COLS:
-                if col in df_temp.columns:
-                    df_target[col] = df_temp[col]
-                else:
-                    if col in ['HOLDINGS_SCRIPLESS','HOLDINGS_SCRIP','TOTAL_HOLDING_SHARES']:
-                        df_target[col] = 0
-                    elif col == 'PERCENTAGE':
-                        df_target[col] = 0.0
+    if not new_files:
+        print("✅ Semua file sudah diproses di GDrive. Memastikan data di MotherDuck lengkap...")
+        df_final = df_existing
+    else:
+        all_new = []
+        for f_info in tqdm(new_files, desc="Processing files"):
+            local_path = os.path.join(TEMP_DIR, f_info['name'])
+            download_file(service, f_info['id'], f_info['mimeType'], local_path)
+            df_temp = process_excel(local_path, f_info['name'])
+            if df_temp is not None and not df_temp.empty:
+                # Map column names to EXPECTED_COLS in order, filling missing ones with default values
+                df_target = pd.DataFrame()
+                for col in EXPECTED_COLS:
+                    if col in df_temp.columns:
+                        df_target[col] = df_temp[col]
                     else:
-                        df_target[col] = ''
-                        
-            # Insert Data Source column (use filename without extension for cleaner tracking)
-            data_source_val = os.path.splitext(f_info['name'])[0]
-            df_target.insert(0, 'Data Source', data_source_val)
-            df_target = df_target.replace(r'\n', ' ', regex=True)
-            
-            # Clean numeric columns safely
-            df_target = clean_numeric_safe(df_target,
-                ['HOLDINGS_SCRIPLESS','HOLDINGS_SCRIP','TOTAL_HOLDING_SHARES'])
-            df_target = clean_numeric_safe(df_target, ['PERCENTAGE'], is_float=True)
-            all_new.append(df_target)
+                        if col in ['HOLDINGS_SCRIPLESS','HOLDINGS_SCRIP','TOTAL_HOLDING_SHARES']:
+                            df_target[col] = 0
+                        elif col == 'PERCENTAGE':
+                            df_target[col] = 0.0
+                        else:
+                            df_target[col] = ''
+                            
+                # Insert Data Source column (use filename without extension for cleaner tracking)
+                data_source_val = os.path.splitext(f_info['name'])[0]
+                df_target.insert(0, 'Data Source', data_source_val)
+                df_target = df_target.replace(r'\n', ' ', regex=True)
+                
+                # Clean numeric columns safely
+                df_target = clean_numeric_safe(df_target,
+                    ['HOLDINGS_SCRIPLESS','HOLDINGS_SCRIP','TOTAL_HOLDING_SHARES'])
+                df_target = clean_numeric_safe(df_target, ['PERCENTAGE'], is_float=True)
+                all_new.append(df_target)
 
-    if not all_new:
-        print("❌ Tidak ada data baru.")
-        return
+        if not all_new:
+            print("❌ Tidak ada data baru.")
+            return
 
-    df_new_batch = pd.concat(all_new, ignore_index=True)
-    df_final = pd.concat([df_existing, df_new_batch], ignore_index=True) \
-               if not df_existing.empty else df_new_batch
+        df_new_batch = pd.concat(all_new, ignore_index=True)
+        df_final = pd.concat([df_existing, df_new_batch], ignore_index=True) \
+                   if not df_existing.empty else df_new_batch
+        save_backup(df_final, service)
 
-    save_backup(df_final, service)
-
-    # Upload ke MotherDuck
+    # Upload ke MotherDuck (Always sync the complete df_final dataset to prevent out-of-sync)
     print("\n🦆 Upload ke MotherDuck...")
-    df_md = df_new_batch.copy()
+    df_md = df_final.copy()
     df_md.columns = [c.lower().replace(' ', '_') for c in df_md.columns]
     
     # Handle multiple date formatting (e.g. YYYY-MM-DD or DD/MM/YYYY)
@@ -271,26 +270,11 @@ def main():
 
     con = duckdb.connect(f'md:{MOTHERDUCK_DB}?motherduck_token={MOTHERDUCK_TOKEN}')
     con.execute("CREATE SCHEMA IF NOT EXISTS ksei")
-    table_exists = con.execute("""
-        SELECT COUNT(*) FROM information_schema.tables
-        WHERE table_schema='ksei' AND table_name='ownership_1pct'
-    """).fetchone()[0]
-
-    if table_exists:
-        try:
-            con.execute("ALTER TABLE ksei.ownership_1pct ALTER COLUMN data_source TYPE VARCHAR")
-        except Exception as e:
-            print(f"   ⚠️ Alter table warning (data_source column): {e}")
-
-    for ds in df_md['data_source'].unique():
-        if table_exists:
-            con.execute(f"DELETE FROM ksei.ownership_1pct WHERE data_source='{ds}'")
-
+    
+    # Drop and recreate table directly from standardized dataframe to enforce correct schema types
     con.register("temp_ksei1", df_md)
-    if table_exists:
-        con.execute("INSERT INTO ksei.ownership_1pct SELECT * FROM temp_ksei1")
-    else:
-        con.execute("CREATE TABLE ksei.ownership_1pct AS SELECT * FROM temp_ksei1")
+    con.execute("DROP TABLE IF EXISTS ksei.ownership_1pct")
+    con.execute("CREATE TABLE ksei.ownership_1pct AS SELECT * FROM temp_ksei1")
 
     count = con.execute("SELECT COUNT(*) FROM ksei.ownership_1pct").fetchone()[0]
     dates = con.execute("SELECT COUNT(DISTINCT date) FROM ksei.ownership_1pct").fetchone()[0]
