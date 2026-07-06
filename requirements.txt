@@ -8,3 +8,4 @@ tqdm
 pdfplumber
 requests
 pyarrow
+openpyxl

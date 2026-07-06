@@ -1,10 +1,9 @@
 # =============================================================================
-# KSEI 1% MONTHLY PIPELINE — GitHub Actions Edition
+# KSEI 1% MONTHLY PIPELINE — GSheet/Excel Edition
 # =============================================================================
 import os, io, json, shutil, time, re
 import pandas as pd
 import numpy as np
-import pdfplumber
 from tqdm import tqdm
 import duckdb
 
@@ -18,7 +17,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 SA_JSON          = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON'])
 MOTHERDUCK_TOKEN = os.environ['MOTHERDUCK_TOKEN']
 
-FOLDER_PDF_ID    = '1lS90X8fvJ87oFDjvdz4JXUNAE6ettaxa'  # ← ganti dengan folder ID Data 1%
+FOLDER_PDF_ID    = '1lS90X8fvJ87oFDjvdz4JXUNAE6ettaxa'  # Google Drive folder ID
 FOLDER_BACKUP_ID = '1hX2jwUrAgi4Fr8xkcFWjCW6vbk6lsIlP'
 BACKUP_CSV_NAME  = 'KSE_1Persen_Monthly_Snapshot.csv'
 MOTHERDUCK_DB    = 'my_db'
@@ -35,12 +34,19 @@ def authenticate():
 # =============================================================================
 # HELPERS
 # =============================================================================
-def list_pdfs(service, folder_id):
+def list_ksei_files(service, folder_id):
     files, page_token = [], None
-    query = f"'{folder_id}' in parents and name contains '.pdf' and trashed=false"
+    # Query Google Sheets, native Excel, or files with .xlsx/.xls in the name
+    query = (
+        f"'{folder_id}' in parents and ("
+        f"mimeType='application/vnd.google-apps.spreadsheet' or "
+        f"mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or "
+        f"name contains '.xlsx' or name contains '.xls'"
+        f") and trashed=false"
+    )
     while True:
         res = service.files().list(
-            q=query, fields="nextPageToken, files(id, name)",
+            q=query, fields="nextPageToken, files(id, name, mimeType)",
             pageToken=page_token, includeItemsFromAllDrives=True,
             supportsAllDrives=True).execute()
         files.extend(res.get('files', []))
@@ -49,8 +55,16 @@ def list_pdfs(service, folder_id):
             break
     return sorted(files, key=lambda x: x['name'])
 
-def download_file(service, file_id, dest_path):
-    request = service.files().get_media(fileId=file_id)
+def download_file(service, file_id, mime_type, dest_path):
+    # If the file is a native Google Sheet, we export it as Excel (.xlsx)
+    if mime_type == 'application/vnd.google-apps.spreadsheet':
+        request = service.files().export_media(
+            fileId=file_id,
+            mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+    else:
+        request = service.files().get_media(fileId=file_id)
+        
     buf = io.BytesIO()
     dl = MediaIoBaseDownload(buf, request)
     done = False
@@ -77,37 +91,71 @@ def load_backup_csv(service):
     processed = set(df['Data Source'].astype(str).tolist()) if 'Data Source' in df.columns else set()
     return df, processed
 
-def clean_numeric(df, columns, is_float=False):
+def clean_numeric_safe(df, columns, is_float=False):
     for col in columns:
         if col in df.columns:
-            df[col] = df[col].astype(str).str.replace(r'\s+','',regex=True)
-            df[col] = df[col].str.replace('.','',regex=False)
-            df[col] = df[col].str.replace(',','.' if is_float else '',regex=False)
-            if is_float:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('float64')
+            # If the column is already read as a numeric data type, just fill NaNs
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].fillna(0)
             else:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('int64')
+                # If it's a string, clean it safely
+                s = df[col].astype(str).str.strip().str.replace(r'\s+','',regex=True)
+                if is_float:
+                    s = s.str.replace('.','',regex=False).str.replace(',','.',regex=False)
+                else:
+                    s = s.str.replace('.','',regex=False).str.replace(',','',regex=False)
+                df[col] = pd.to_numeric(s, errors='coerce').fillna(0)
+            
+            if is_float:
+                df[col] = df[col].astype('float64')
+            else:
+                df[col] = df[col].astype('int64')
     return df
 
-def process_pdf(file_path, filename):
-    rows = []
+def process_excel(file_path, filename):
     try:
-        with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages:
-                table = page.extract_table()
-                if table and len(table[0]) > 5:
-                    for row in table:
-                        if not row:
-                            continue
-                        if all(x is None or str(x).strip() == '' for x in row):
-                            continue
-                        row_str = str(row).lower()
-                        if any(kw in row_str for kw in ['share_code','investor_name','total_holding','halaman']):
-                            continue
-                        rows.append(row)
+        df = pd.read_excel(file_path, sheet_name=0)
+        df = df.dropna(how='all')
+        
+        # Scan first 15 rows to detect header row containing key columns
+        header_idx = None
+        for i in range(min(15, len(df))):
+            row_vals = [str(val).upper().strip() for val in df.iloc[i].values]
+            if 'SHARE_CODE' in row_vals or 'SHARE CODE' in row_vals or 'INVESTOR_NAME' in row_vals or 'INVESTOR NAME' in row_vals:
+                header_idx = i
+                break
+                
+        if header_idx is not None:
+            cols = [str(c).upper().strip().replace(' ', '_') for c in df.iloc[header_idx].values]
+            df_clean = df.iloc[header_idx + 1:].copy()
+            df_clean.columns = cols
+            df = df_clean
+        else:
+            df.columns = [str(c).upper().strip().replace(' ', '_') for c in df.columns]
+            
+        # Standardize column naming variations
+        df = df.rename(columns={
+            'SHARECODE': 'SHARE_CODE',
+            'ISSUERNAME': 'ISSUER_NAME',
+            'INVESTORNAME': 'INVESTOR_NAME',
+            'INVESTORTYPE': 'INVESTOR_TYPE',
+            'LOCALFOREIGN': 'LOCAL_FOREIGN',
+            'HOLDINGSSCRIPLESS': 'HOLDINGS_SCRIPLESS',
+            'HOLDINGSSCRIP': 'HOLDINGS_SCRIP',
+            'TOTALHOLDINGSHARES': 'TOTAL_HOLDING_SHARES',
+            'TOTAL_HOLDING': 'TOTAL_HOLDING_SHARES',
+            'TOTAL_SHARES': 'TOTAL_HOLDING_SHARES',
+        })
+        
+        # Filter rows: Keep only rows with valid stock code (4-6 chars uppercase alphanumeric/hyphen)
+        if 'SHARE_CODE' in df.columns:
+            df['SHARE_CODE'] = df['SHARE_CODE'].astype(str).str.strip().str.upper()
+            df = df[df['SHARE_CODE'].str.match(r'^[A-Z0-9-]{4,6}$', na=False)]
+            
+        return df
     except Exception as e:
-        print(f"   ⚠️ {filename}: {e}")
-    return rows
+        print(f"   ⚠️ Error processing Excel '{filename}': {e}")
+        return None
 
 def save_backup(df, service):
     buf   = io.StringIO()
@@ -133,7 +181,7 @@ def save_backup(df, service):
 def main():
     start = time.time()
     print("="*60)
-    print("🚀 KSEI 1% MONTHLY — GitHub Actions Edition")
+    print("🚀 KSEI 1% MONTHLY — GSheet/Excel Edition")
     print("="*60)
 
     os.makedirs(TEMP_DIR, exist_ok=True)
@@ -143,12 +191,21 @@ def main():
     df_existing, processed_sources = load_backup_csv(service)
     print(f"📂 Existing: {len(df_existing):,} rows | {len(processed_sources)} batches")
 
-    all_pdfs = list_pdfs(service, FOLDER_PDF_ID)
-    new_pdfs = [f for f in all_pdfs if f['name'][:8] not in processed_sources]
-    print(f"📄 {len(all_pdfs)} total | {len(new_pdfs)} baru")
+    all_files = list_ksei_files(service, FOLDER_PDF_ID)
+    
+    # Track unprocessed files: matches either full name, name without extension, or first 8 chars
+    new_files = []
+    for f in all_files:
+        name = f['name']
+        name_no_ext = os.path.splitext(name)[0]
+        prefix_8 = name[:8]
+        if prefix_8 not in processed_sources and name_no_ext not in processed_sources and name not in processed_sources:
+            new_files.append(f)
+            
+    print(f"📄 {len(all_files)} total | {len(new_files)} baru")
 
-    if not new_pdfs:
-        print("✅ Semua PDF sudah diproses.")
+    if not new_files:
+        print("✅ Semua file sudah diproses.")
         return
 
     EXPECTED_COLS = [
@@ -158,21 +215,34 @@ def main():
     ]
 
     all_new = []
-    for pdf_file in tqdm(new_pdfs, desc="Processing PDFs"):
-        local_path = os.path.join(TEMP_DIR, pdf_file['name'])
-        download_file(service, pdf_file['id'], local_path)
-        rows = process_pdf(local_path, pdf_file['name'])
-        if rows:
-            df_temp = pd.DataFrame(rows)
-            if len(df_temp.columns) >= 12:
-                df_temp = df_temp.iloc[:, :12]
-                df_temp.columns = EXPECTED_COLS
-                df_temp.insert(0, 'Data Source', pdf_file['name'][:8])
-                df_temp = df_temp.replace(r'\n', ' ', regex=True)
-                df_temp = clean_numeric(df_temp,
-                    ['HOLDINGS_SCRIPLESS','HOLDINGS_SCRIP','TOTAL_HOLDING_SHARES'])
-                df_temp = clean_numeric(df_temp, ['PERCENTAGE'], is_float=True)
-                all_new.append(df_temp)
+    for f_info in tqdm(new_files, desc="Processing files"):
+        local_path = os.path.join(TEMP_DIR, f_info['name'])
+        download_file(service, f_info['id'], f_info['mimeType'], local_path)
+        df_temp = process_excel(local_path, f_info['name'])
+        if df_temp is not None and not df_temp.empty:
+            # Map column names to EXPECTED_COLS in order, filling missing ones with default values
+            df_target = pd.DataFrame()
+            for col in EXPECTED_COLS:
+                if col in df_temp.columns:
+                    df_target[col] = df_temp[col]
+                else:
+                    if col in ['HOLDINGS_SCRIPLESS','HOLDINGS_SCRIP','TOTAL_HOLDING_SHARES']:
+                        df_target[col] = 0
+                    elif col == 'PERCENTAGE':
+                        df_target[col] = 0.0
+                    else:
+                        df_target[col] = ''
+                        
+            # Insert Data Source column (use filename without extension for cleaner tracking)
+            data_source_val = os.path.splitext(f_info['name'])[0]
+            df_target.insert(0, 'Data Source', data_source_val)
+            df_target = df_target.replace(r'\n', ' ', regex=True)
+            
+            # Clean numeric columns safely
+            df_target = clean_numeric_safe(df_target,
+                ['HOLDINGS_SCRIPLESS','HOLDINGS_SCRIP','TOTAL_HOLDING_SHARES'])
+            df_target = clean_numeric_safe(df_target, ['PERCENTAGE'], is_float=True)
+            all_new.append(df_target)
 
     if not all_new:
         print("❌ Tidak ada data baru.")
@@ -188,7 +258,9 @@ def main():
     print("\n🦆 Upload ke MotherDuck...")
     df_md = df_new_batch.copy()
     df_md.columns = [c.lower().replace(' ', '_') for c in df_md.columns]
-    df_md['date'] = pd.to_datetime(df_md['date'], dayfirst=True, errors='coerce').dt.date
+    
+    # Handle multiple date formatting (e.g. YYYY-MM-DD or DD/MM/YYYY)
+    df_md['date'] = pd.to_datetime(df_md['date'], errors='coerce').dt.date
     df_md = df_md.dropna(subset=['date'])
 
     for col in ['holdings_scripless','holdings_scrip','total_holding_shares']:
