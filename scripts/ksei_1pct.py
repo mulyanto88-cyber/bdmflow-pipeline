@@ -276,6 +276,12 @@ def main():
         WHERE table_schema='ksei' AND table_name='ownership_1pct'
     """).fetchone()[0]
 
+    if table_exists:
+        try:
+            con.execute("ALTER TABLE ksei.ownership_1pct ALTER COLUMN data_source TYPE VARCHAR")
+        except Exception as e:
+            print(f"   ⚠️ Alter table warning (data_source column): {e}")
+
     for ds in df_md['data_source'].unique():
         if table_exists:
             con.execute(f"DELETE FROM ksei.ownership_1pct WHERE data_source='{ds}'")
