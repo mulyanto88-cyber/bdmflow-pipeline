@@ -19,7 +19,7 @@ jobs:
           python-version: '3.11'
       - name: Install duckdb
         run: pip install duckdb==1.5.2
-      - name: Refresh all 16 materialized tables
+      - name: Refresh all materialized tables
         env:
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
           PYTHONUNBUFFERED: "1"
@@ -55,6 +55,11 @@ jobs:
           refresh('market.tb_stock_latest',       'SELECT * FROM market.vw_stock_latest')
           refresh('market.tb_smart_money_score',  'SELECT * FROM market.vw_smart_money_score')
           refresh('main.tb_broker_rolling_net',   'SELECT * FROM main.vw_broker_rolling_net')
+
+          # 1.3: vw_c_composite_score measured 5.0s and is read three times per run
+          # (score_calibration, composite_v2, and the app's stock-detail route).
+          # Snapshot it once here; the steps below then read the table.
+          refresh('market.tb_composite_score', 'SELECT * FROM market.vw_c_composite_score')
 
           # 7: broker accumulation — 5 multi-period tables (5d/14d/30d/60d/90d)
           # REBUILT: broker_activity is zero-sum at stock level (SUM(value)=0), so the old
@@ -356,8 +361,8 @@ jobs:
               COUNT(*) AS n,
               CURRENT_TIMESTAMP AS refreshed_at
           FROM (
-                        SELECT 'composite_score'     AS metric, composite_score::DOUBLE     AS score FROM market.vw_c_composite_score
-              UNION ALL SELECT 'daily_trigger_score',          daily_trigger_score::DOUBLE          FROM market.vw_c_composite_score
+                        SELECT 'composite_score'     AS metric, composite_score::DOUBLE     AS score FROM market.tb_composite_score
+              UNION ALL SELECT 'daily_trigger_score',          daily_trigger_score::DOUBLE          FROM market.tb_composite_score
               UNION ALL SELECT 'radar_score',                  radar_score::DOUBLE                  FROM market.vw_watchlist_radar
               UNION ALL SELECT 'smart_money_score',            smart_money_score::DOUBLE            FROM market.vw_smart_money_score
           )
@@ -425,7 +430,7 @@ jobs:
           CROSS JOIN cutoffs co
           LEFT JOIN market.company_profile cp ON cp.stock_code = sc.stock_code
           LEFT JOIN market.vw_f_price_history ph ON ph.stock_code = sc.stock_code AND ph.trading_date = (SELECT d FROM latest)
-          LEFT JOIN market.vw_c_composite_score cs ON cs.stock_code = sc.stock_code
+          LEFT JOIN market.tb_composite_score cs ON cs.stock_code = sc.stock_code
           ORDER BY v2_score DESC
           \"\"\")
 
