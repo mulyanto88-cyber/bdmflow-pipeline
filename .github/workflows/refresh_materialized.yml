@@ -28,12 +28,19 @@ jobs:
           import duckdb, os, time
           con = duckdb.connect(f'md:my_db?motherduck_token={os.environ[\"MOTHERDUCK_TOKEN\"]}')
 
+          # Every refresh is recorded so the app can tell fresh data from a silently
+          # failed run. Without this, a broken job just keeps serving yesterday's
+          # numbers with full confidence — worse than being slow.
+          manifest = []
+
           def refresh(tbl, sql):
               start = time.time()
               print(f'  Refreshing {tbl}... ', end='', flush=True)
               con.execute(f'CREATE OR REPLACE TABLE {tbl} AS {sql}')
               n = con.execute(f'SELECT COUNT(*) FROM {tbl}').fetchone()[0]
-              print(f'{n} rows ({time.time()-start:.1f}s)')
+              secs = time.time() - start
+              manifest.append((tbl, int(n), round(secs, 1)))
+              print(f'{n} rows ({secs:.1f}s)')
 
           # 1-6: view-based tables
           refresh('market.tb_broker_screener',  'SELECT * FROM market.vw_d_composite_tab')
@@ -422,6 +429,29 @@ jobs:
           ORDER BY v2_score DESC
           \"\"\")
 
-          print('Done. All 16 tables refreshed.')
+          # ── Freshness manifest ────────────────────────────────────────────
+          # One row per refreshed table plus the trading date the data actually
+          # covers, so the app can surface staleness instead of trusting silence.
+          # Written LAST: if any refresh above raised, the job fails and the old
+          # manifest survives, still showing the previous (now stale) timestamp.
+          con.execute('CREATE SCHEMA IF NOT EXISTS main')
+          rows = ', '.join(
+              \"('%s', %d, %s)\" % (t, n, s) for t, n, s in manifest
+          )
+          con.execute(f'''
+              CREATE OR REPLACE TABLE main.tb_etl_manifest AS
+              WITH refreshed AS (
+                  SELECT * FROM (VALUES {rows}) AS t(table_name, row_count, seconds)
+              )
+              SELECT
+                  r.table_name,
+                  r.row_count,
+                  r.seconds,
+                  CURRENT_TIMESTAMP AS refreshed_at,
+                  (SELECT MAX(trading_date) FROM market.daily_transactions) AS data_trading_date
+              FROM refreshed r
+          ''')
+          total = con.execute('SELECT COUNT(*) FROM main.tb_etl_manifest').fetchone()[0]
+          print(f'Done. {total} tables refreshed, manifest written.')
           con.close()
           "
