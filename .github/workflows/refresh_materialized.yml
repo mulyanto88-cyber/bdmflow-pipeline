@@ -45,7 +45,23 @@ jobs:
           # 1-6: view-based tables
           refresh('market.tb_broker_screener',  'SELECT * FROM market.vw_d_composite_tab')
           refresh('market.tb_foreign_screener', 'SELECT * FROM market.vw_d_daily_flow_tab')
-          refresh('ksei.tb_ksei_screener',      'SELECT * FROM ksei.vw_d_ksei_tab')
+          # Seven columns arrive from the view still carrying KSEI's capitalised
+          # header names. Postgres folds an unquoted Top_Buyer to top_buyer, so
+          # they are renamed at materialization rather than quoted at every call
+          # site in the app.
+          refresh('ksei.tb_ksei_screener', \"\"\"
+          SELECT * EXCLUDE (Is_Split_Suspect, Is_Reverse_Suspect, Top_Buyer,
+                            Top_Buyer_Val, Top_Seller, Top_Seller_Val,
+                            Is_CorpAction_Suspect),
+              Is_Split_Suspect      AS is_split_suspect,
+              Is_Reverse_Suspect    AS is_reverse_suspect,
+              Top_Buyer             AS top_buyer,
+              Top_Buyer_Val         AS top_buyer_val,
+              Top_Seller            AS top_seller,
+              Top_Seller_Val        AS top_seller_val,
+              Is_CorpAction_Suspect AS is_corpaction_suspect
+          FROM ksei.vw_d_ksei_tab
+          \"\"\")
           refresh('market.tb_market_summary',   'SELECT * FROM market.vw_market_summary')
           refresh('market.tb_market_pulse',     'SELECT * FROM market.vw_d_market_pulse_tab')
           refresh('market.tb_radar',            'SELECT * FROM market.vw_watchlist_radar')
@@ -469,7 +485,20 @@ jobs:
           refresh('main.tb_insider_net_flow_by_stock','SELECT * FROM main.vw_insider_net_flow_by_stock')
 
           # Priority 5: KSEI — stealth called 4×, individual_changes 6×
-          refresh('ksei.tb_stealth_accumulation',     'SELECT * FROM ksei.vw_stealth_accumulation')
+          # Every column here is capitalised upstream; renamed for the same
+          # reason as tb_ksei_screener above.
+          refresh('ksei.tb_stealth_accumulation', \"\"\"
+          SELECT
+              Code              AS code,
+              Date              AS date,
+              Price             AS price,
+              Prev_Price        AS prev_price,
+              Price_Chg_Pct     AS price_chg_pct,
+              CP_Flow_Miliar    AS cp_flow_miliar,
+              Foreign_CP_Miliar AS foreign_cp_miliar,
+              Signal            AS signal
+          FROM ksei.vw_stealth_accumulation
+          \"\"\")
           refresh('ksei.tb_ksei_inst_positioning',    'SELECT * FROM ksei.vw_ksei_inst_positioning')
           refresh('ksei.tb_ksei_individual_changes',  'SELECT * FROM ksei.vw_ksei_individual_changes')
           refresh('ksei.tb_insider_screener',         'SELECT * FROM ksei.vw_insider_screener')
