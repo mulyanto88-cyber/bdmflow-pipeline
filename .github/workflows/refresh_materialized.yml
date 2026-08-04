@@ -61,6 +61,11 @@ jobs:
           # Snapshot it once here; the steps below then read the table.
           refresh('market.tb_composite_score', 'SELECT * FROM market.vw_c_composite_score')
 
+          # 1.4: the last view the app still read at request time. Only ~0.8s per
+          # call, but broker-tracker joins it twice on every stock load, and on
+          # the free tier the daily budget is 20 compute-minutes.
+          refresh('market.tb_broker_ksei_confirm', 'SELECT * FROM market.vw_broker_ksei_confirm')
+
           # 7: broker accumulation — 5 multi-period tables (5d/14d/30d/60d/90d)
           # REBUILT: broker_activity is zero-sum at stock level (SUM(value)=0), so the old
           # net_accumulation/net_ratio/LN(breadth) term was ~0 noise. Now ranks by SMART-broker
