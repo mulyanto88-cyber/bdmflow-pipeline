@@ -190,12 +190,24 @@ def build_transform_sql():
         for t in types
     ]
 
-    final_cols = ['  Date, Code, Type, "Sec._Num", Price']
-    for t in LOCALS:   final_cols.append(f'  {q(t)}')
-    final_cols.append('  Total_Local')
-    for t in FOREIGNS: final_cols.append(f'  {q(t)}')
-    final_cols.append('  Total_Foreign')
-    for t in types:    final_cols.append(f'  COALESCE(_p_{t}, 0) AS {q(t+"_1")}')
+    # Output columns are emitted lower-case. The KSEI source files use
+    # capitalised headers, and Postgres folds an unquoted `Date` to `date` — so
+    # every query written as `SELECT Date FROM ksei.monthly_snapshot` would fail
+    # there against a column actually named `Date`. Naming the columns lower-case
+    # here keeps all ~120 existing unquoted references in the app working on both
+    # engines, instead of quoting them one by one. DuckDB resolves unquoted names
+    # case-insensitively, so nothing downstream changes today.
+    #
+    # "Sec._Num" is deliberately left alone: the app never reads it, and the two
+    # views that do already quote it, which behaves identically on Postgres.
+    lc = lambda c: c.lower()
+
+    final_cols = ['  Date AS date, Code AS code, Type AS type, "Sec._Num", Price AS price']
+    for t in LOCALS:   final_cols.append(f'  {q(t)} AS {lc(t)}')
+    final_cols.append('  Total_Local AS total_local')
+    for t in FOREIGNS: final_cols.append(f'  {q(t)} AS {lc(t)}')
+    final_cols.append('  Total_Foreign AS total_foreign')
+    for t in types:    final_cols.append(f'  COALESCE(_p_{t}, 0) AS {lc(t+"_1")}')
     final_cols += [
         '  (COALESCE("Local_IS",0)+COALESCE("Local_CP",0)+COALESCE("Local_PF",0)'
         '+COALESCE("Local_IB",0)+COALESCE("Local_ID",0)+COALESCE("Local_MF",0)'
@@ -203,19 +215,19 @@ def build_transform_sql():
         '+COALESCE("Foreign_IS",0)+COALESCE("Foreign_CP",0)+COALESCE("Foreign_PF",0)'
         '+COALESCE("Foreign_IB",0)+COALESCE("Foreign_ID",0)+COALESCE("Foreign_MF",0)'
         '+COALESCE("Foreign_SC",0)+COALESCE("Foreign_FD",0)+COALESCE("Foreign_OT",0))'
-        ' AS Total_Shares',
-        '  _is_split   AS Is_Split_Suspect',
-        '  _is_reverse AS Is_Reverse_Suspect',
-        '  CASE WHEN _best.v  > 0 THEN _best.t   END AS Top_Buyer',
-        '  CASE WHEN _best.v  > 0 THEN _best.v   END AS Top_Buyer_Vol',
-        '  CASE WHEN _worst.v < 0 THEN _worst.t  END AS Top_Seller',
-        '  CASE WHEN _worst.v < 0 THEN _worst.v  END AS Top_Seller_Vol',
-        '  CASE WHEN _best.v  > 0 THEN _best.val END AS Top_Buyer_Val',
-        '  CASE WHEN _worst.v < 0 THEN _worst.val END AS Top_Seller_Val',
+        ' AS total_shares',
+        '  _is_split   AS is_split_suspect',
+        '  _is_reverse AS is_reverse_suspect',
+        '  CASE WHEN _best.v  > 0 THEN _best.t   END AS top_buyer',
+        '  CASE WHEN _best.v  > 0 THEN _best.v   END AS top_buyer_vol',
+        '  CASE WHEN _worst.v < 0 THEN _worst.t  END AS top_seller',
+        '  CASE WHEN _worst.v < 0 THEN _worst.v  END AS top_seller_vol',
+        '  CASE WHEN _best.v  > 0 THEN _best.val END AS top_buyer_val',
+        '  CASE WHEN _worst.v < 0 THEN _worst.val END AS top_seller_val',
     ]
     for t in types:
-        final_cols.append(f'  d_{t}         AS {q(t+"_Chg_Vol")}')
-        final_cols.append(f'  d_{t} * Price AS {q(t+"_Chg_Val")}')
+        final_cols.append(f'  d_{t}         AS {lc(t+"_Chg_Vol")}')
+        final_cols.append(f'  d_{t} * Price AS {lc(t+"_Chg_Val")}')
 
     return f"""
 CREATE OR REPLACE TABLE ksei.monthly_snapshot AS
