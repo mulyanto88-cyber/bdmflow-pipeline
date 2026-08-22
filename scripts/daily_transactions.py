@@ -395,6 +395,24 @@ def main():
         df_final = process_full_dataframe(df_combined)
         save_backup_to_drive(df_final, drive_svc)
 
+    # ── Nama emiten: sheet sumber punya kolom nama (mis. "Nama Emiten")
+    #    yang selama ini TERBUANG karena col_map hanya memetakan kolom pasar.
+    #    Tangkap di sini SEBELUM prepare_for_motherduck membuangnya, lalu
+    #    upsert ke market.company_profile saat upload ke MotherDuck. ─────
+    name_col = next((c for c in df_final.columns
+                     if any(k in str(c).lower() for k in ['nama', 'name', 'emiten', 'company'])), None)
+    if name_col:
+        df_names = (
+            df_final[['Stock Code', name_col]]
+            .dropna()
+            .drop_duplicates('Stock Code')
+            .rename(columns={name_col: 'company_name'})
+        )
+        print(f"   🏢 Kolom nama emiten terdeteksi: '{name_col}' — {len(df_names)} saham")
+    else:
+        df_names = None
+        print("   ⚠️ Kolom nama emiten tidak ditemukan — company_profile tidak di-update")
+
     df_md = prepare_for_motherduck(df_final)
 
     print(f"\n🦆 Upload ke MotherDuck...")
@@ -416,6 +434,24 @@ def main():
                    signal, tradeable_shares, source_file
             FROM temp_daily
         """)
+
+        # ── company_profile.company_name: upsert dari sheet ───────────
+        if df_names is not None and len(df_names) > 0:
+            con.execute("ALTER TABLE market.company_profile ADD COLUMN IF NOT EXISTS company_name VARCHAR")
+            con.register("temp_names", df_names)
+            con.execute("""
+                UPDATE market.company_profile cp
+                SET company_name = t.company_name
+                FROM temp_names t
+                WHERE cp.stock_code = t."Stock Code"
+            """)
+            con.execute("""
+                INSERT INTO market.company_profile (stock_code, company_name)
+                SELECT t."Stock Code", t.company_name FROM temp_names t
+                WHERE t."Stock Code" NOT IN (SELECT stock_code FROM market.company_profile)
+            """)
+            named = con.execute("SELECT COUNT(*) FROM market.company_profile WHERE company_name IS NOT NULL").fetchone()[0]
+            print(f"   ✅ company_profile.company_name terisi: {named} emiten")
 
         count  = con.execute(f"SELECT COUNT(*) FROM {MD_SCHEMA}.{MD_TABLE}").fetchone()[0]
         latest = con.execute(f"SELECT MAX(trading_date) FROM {MD_SCHEMA}.{MD_TABLE}").fetchone()[0]
