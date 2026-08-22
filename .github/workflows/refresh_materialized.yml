@@ -48,7 +48,8 @@ jobs:
               # Sampai kolom itu ada, refresh nama dilewati supaya job ini
               # tidak gagal gara-gara kolom yang belum dibuat.
               try:
-                  return con.execute(f"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='market' AND table_name='{table}' AND column_name='{column}'").fetchone()[0] > 0
+                  q = \"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='market' AND table_name='\" + table + \"' AND column_name='\" + column + \"'\"
+                  return con.execute(q).fetchone()[0] > 0
               except Exception:
                   return False
 
