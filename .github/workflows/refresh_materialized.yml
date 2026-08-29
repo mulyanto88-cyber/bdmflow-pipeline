@@ -53,6 +53,20 @@ jobs:
               except Exception:
                   return False
 
+          # 0. Sync automated free float from company_keystats into company_profile
+          try:
+              print('  Syncing free float from company_keystats to company_profile... ', end='', flush=True)
+              con.execute('''
+                  UPDATE market.company_profile cp
+                  SET free_float = ks.free_float_pct
+                  FROM market.company_keystats ks
+                  WHERE cp.stock_code = ks.stock_code
+                    AND ks.free_float_pct IS NOT NULL
+              ''')
+              print('DONE')
+          except Exception as e:
+              print(f'SKIPPED ({e})')
+
           # 1-6: view-based tables
           refresh('market.tb_broker_screener',  'SELECT * FROM market.vw_d_composite_tab')
           refresh('market.tb_foreign_screener', 'SELECT * FROM market.vw_d_daily_flow_tab')
