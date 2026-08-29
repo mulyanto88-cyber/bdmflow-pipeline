@@ -1,11 +1,13 @@
 # =============================================================================
-# STOCKBIT KEY STATS & FUNDAMENTALS PIPELINE — GitHub Actions Edition
+# STOCKBIT KEY STATS & FUNDAMENTALS PIPELINE — Production Edition
+# Endpoint: https://exodus.stockbit.com/keystats/ratio/v1/{STOCK_CODE}?year_limit=10
 # =============================================================================
 import os
 import sys
 import json
 import time
 import random
+import re
 import requests
 import duckdb
 from datetime import datetime
@@ -24,10 +26,10 @@ TOKEN_SHEET_ID   = os.environ['TOKEN_SHEET_ID']
 MOTHERDUCK_DB    = 'my_db'
 MD_SCHEMA        = 'market'
 MD_TABLE         = 'company_keystats'
-BASE_URL         = 'https://exodus.stockbit.com'
+BASE_URL         = 'https://exodus.stockbit.com/keystats/ratio/v1'
 
 # =============================================================================
-# HELPERS
+# HELPERS & PARSERS
 # =============================================================================
 def authenticate():
     creds = service_account.Credentials.from_service_account_info(
@@ -48,31 +50,44 @@ def make_headers(token):
         'Origin':        'https://stockbit.com',
     }
 
-def clean_num(val):
-    """Safely converts numeric or string number representations to float/int."""
-    if val is None:
+def clean_val(val_str):
+    """
+    Parses Stockbit formatted value strings to float.
+    Examples:
+      '239.09'      -> 239.09
+      '0.63%'       -> 0.63
+      '-17.58%'     -> -17.58
+      '(1,614 B)'   -> -1614.0
+      '3,777 B'     -> 3777.0
+      '(4.63 M)'    -> -4.63
+      '141.78 B'    -> 141.78
+      '106,338 B'   -> 106338.0
+      '-' / '' / N/A-> None
+    """
+    if val_str is None:
         return None
-    if isinstance(val, (int, float)):
-        return float(val)
-    s = str(val).replace(',', '').replace('%', '').replace('+', '').strip()
-    if not s or s == '-' or s == 'N/A' or s == 'null':
+    s = str(val_str).strip()
+    if not s or s in ('-', 'N/A', 'null', 'None'):
         return None
+    
+    is_negative = False
+    if s.startswith('(') and s.endswith(')'):
+        is_negative = True
+        s = s[1:-1].strip()
+    elif s.startswith('-'):
+        is_negative = True
+        s = s[1:].strip()
+
+    # Remove unit suffixes and commas
+    s = s.replace(',', '').replace('%', '').replace('+', '').strip()
+    # Remove 'B', 'M', 'T', 'K' if attached
+    s = re.sub(r'[BMTK]$', '', s).strip()
+
     try:
-        return float(s)
+        num = float(s)
+        return -num if is_negative else num
     except Exception:
         return None
-
-def extract_metric(items_dict, *candidate_keys):
-    """Searches for candidate keys in a key-stats dictionary or nested item list."""
-    for k in candidate_keys:
-        if k in items_dict and items_dict[k] is not None:
-            v = items_dict[k]
-            if isinstance(v, dict):
-                v = v.get('value') or v.get('val') or v.get('raw') or v.get('formatted')
-            res = clean_num(v)
-            if res is not None:
-                return res
-    return None
 
 def get_stock_codes(con):
     """Fetches list of active stocks from daily_transactions or company_profile."""
@@ -100,118 +115,115 @@ def get_stock_codes(con):
         return [r[0] for r in rows]
     except Exception as e:
         print(f"⚠️ Gagal ambil list dari company_profile: {e}")
-        return ['BBCA', 'BBRI', 'BMRI', 'BBNI', 'ASII', 'TLKM', 'TPIA', 'AMMN', 'BRIS', 'ADRO', 'PTBA', 'ICBP', 'UNVR', 'GOTO', 'KLBF']
+        return ['BBCA', 'BBRI', 'BMRI', 'BBNI', 'ASII', 'TLKM', 'BRMS', 'AMMN', 'BRIS', 'ADRO']
 
-def fetch_company_keystats(headers, stock_code):
+def fetch_keystats_stock(headers, stock_code):
     """
-    Calls Stockbit Exodus Key Stats API for a single stock code.
-    Tries primary keystats endpoint and company financials.
+    Calls https://exodus.stockbit.com/keystats/ratio/v1/{stock_code}?year_limit=10
+    and parses all sections into a flat record.
     """
-    url = f'{BASE_URL}/keystats/company/{stock_code}'
+    url = f'{BASE_URL}/{stock_code}?year_limit=10'
     r = requests.get(url, headers=headers, timeout=20)
     
-    if r.status_code == 404 or r.status_code == 400:
-        # Fallback to alternate endpoint if any
-        url = f'{BASE_URL}/company/keystats/{stock_code}'
+    if r.status_code == 429:
+        # Rate limit hit, wait and retry once
+        time.sleep(5)
         r = requests.get(url, headers=headers, timeout=20)
-        
+
     r.raise_for_status()
     res_json = r.json()
     data = res_json.get('data', {})
-    
-    # Stockbit typically returns keystats as a flat dict or categorized sections
-    # Flatten all fields for easy key lookup
-    flattened = {}
-    
-    def walk(obj):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if isinstance(v, (dict, list)):
-                    walk(v)
-                else:
-                    flattened[k.lower().replace(' ', '_').replace('-', '_')] = v
-        elif isinstance(obj, list):
-            for item in obj:
-                if isinstance(item, dict):
-                    # Check for { "name": "PE Ratio", "value": 15.2 } structure
-                    name = item.get('name') or item.get('title') or item.get('key') or item.get('label')
-                    val = item.get('value') or item.get('val') or item.get('raw') or item.get('formatted')
-                    if name and val is not None:
-                        clean_name = str(name).lower().replace(' ', '_').replace('-', '_').replace('(', '').replace(')', '').replace('/', '_')
-                        flattened[clean_name] = val
-                    walk(item)
 
-    walk(data)
+    # 1. Stats header
+    stats = data.get('stats', {})
+    mcap_b        = clean_val(stats.get('market_cap'))
+    shares_out_b  = clean_val(stats.get('current_share_outstanding'))
+    ev_b          = clean_val(stats.get('enterprise_value'))
+    free_float    = clean_val(stats.get('free_float'))
 
-    # Extract Key Metrics
-    market_cap        = extract_metric(flattened, 'market_cap', 'market_capitalization', 'mcap')
-    shares_out        = extract_metric(flattened, 'shares_outstanding', 'total_shares', 'shares')
-    pe_ttm            = extract_metric(flattened, 'pe_ratio_ttm', 'pe_ratio', 'per_ttm', 'pe_ttm', 'current_pe_ratio_ttm', 'p_e_ratio_ttm')
-    pe_ann            = extract_metric(flattened, 'pe_ratio_annualized', 'per_annualized', 'forward_pe', 'pe_annualised')
-    pbv               = extract_metric(flattened, 'pbv_ratio', 'price_to_book_value', 'price_to_book', 'pbv', 'pb_ratio')
-    ps_ratio          = extract_metric(flattened, 'price_to_sales_ttm', 'price_to_sales', 'ps_ratio', 'ps_ttm', 'p_s_ratio')
-    ev_ebitda         = extract_metric(flattened, 'ev_ebitda', 'ev_to_ebitda', 'ev_ebitda_ttm', 'ev_to_ebitda_ttm')
-    eps_ttm           = extract_metric(flattened, 'eps_ttm', 'earnings_per_share_ttm', 'eps_trailing_12m')
-    eps_ann           = extract_metric(flattened, 'eps_annualized', 'eps_ann')
-    bvps              = extract_metric(flattened, 'bvps', 'book_value_per_share', 'book_value_share')
-    dps               = extract_metric(flattened, 'dividend_per_share', 'dps', 'dps_ttm')
-    div_yield         = extract_metric(flattened, 'dividend_yield', 'div_yield', 'dividend_yield_ttm')
-    payout_ratio      = extract_metric(flattened, 'payout_ratio', 'dividend_payout_ratio', 'dpr')
-    roe               = extract_metric(flattened, 'roe_ttm', 'return_on_equity_ttm', 'roe', 'return_on_equity')
-    roa               = extract_metric(flattened, 'roa_ttm', 'return_on_assets_ttm', 'roa', 'return_on_assets')
-    gpm               = extract_metric(flattened, 'gpm_ttm', 'gross_profit_margin_ttm', 'gross_margin', 'gpm')
-    opm               = extract_metric(flattened, 'opm_ttm', 'operating_profit_margin_ttm', 'operating_margin', 'opm')
-    npm               = extract_metric(flattened, 'npm_ttm', 'net_profit_margin_ttm', 'net_margin', 'npm')
-    revenue_ttm       = extract_metric(flattened, 'revenue_ttm', 'total_revenue_ttm', 'revenue', 'sales_ttm')
-    revenue_growth    = extract_metric(flattened, 'revenue_growth_yoy', 'quarterly_revenue_growth_yoy', 'revenue_growth')
-    net_income_ttm    = extract_metric(flattened, 'net_income_ttm', 'net_profit_ttm', 'net_income')
-    net_income_growth = extract_metric(flattened, 'net_income_growth_yoy', 'quarterly_net_income_growth_yoy', 'earnings_growth_yoy')
-    total_assets      = extract_metric(flattened, 'total_assets', 'assets')
-    total_liabilities = extract_metric(flattened, 'total_liabilities', 'liabilities')
-    total_equity      = extract_metric(flattened, 'total_equity', 'equity', 'stockholders_equity')
-    cash_equiv        = extract_metric(flattened, 'cash_and_equivalents', 'cash', 'cash_and_cash_equivalents')
-    total_debt        = extract_metric(flattened, 'total_debt', 'debt')
-    der               = extract_metric(flattened, 'debt_to_equity', 'debt_to_equity_ratio', 'der', 'debt_equity')
-    current_ratio     = extract_metric(flattened, 'current_ratio', 'cr')
-    free_cash_flow    = extract_metric(flattened, 'free_cash_flow_ttm', 'free_cash_flow', 'fcf')
-    
-    # Financial Period string
-    period_str = str(data.get('quarter') or data.get('period') or flattened.get('latest_quarter') or flattened.get('period') or 'Latest')
+    # 2. Key Stats Groups
+    item_map = {}
+    for group in data.get('closure_fin_items_results', []):
+        for sub in group.get('fin_name_results', []):
+            fitem = sub.get('fitem', {})
+            name = fitem.get('name')
+            val = fitem.get('value')
+            if name:
+                item_map[name.strip()] = clean_val(val)
+
+    # 3. Latest Financial Quarter
+    latest_period = 'Latest'
+    for group in data.get('financial_year_parent', {}).get('financial_year_groups', []):
+        mrq = group.get('most_recent_quarter', {})
+        if mrq.get('quarter') and mrq.get('date'):
+            latest_period = f"{mrq.get('quarter')} ({mrq.get('date')})"
+            break
 
     return {
-        'stock_code':            stock_code,
-        'market_cap':            market_cap,
-        'shares_outstanding':    int(shares_out) if shares_out else None,
-        'pe_ratio_ttm':          pe_ttm,
-        'pe_ratio_annualized':   pe_ann,
-        'pbv_ratio':             pbv,
-        'ps_ratio':              ps_ratio,
-        'ev_ebitda':             ev_ebitda,
-        'eps_ttm':               eps_ttm,
-        'eps_annualized':        eps_ann,
-        'bvps':                  bvps,
-        'dps':                   dps,
-        'dividend_yield':        div_yield,
-        'payout_ratio':          payout_ratio,
-        'roe_ttm':               roe,
-        'roa_ttm':               roa,
-        'gpm_ttm':               gpm,
-        'opm_ttm':               opm,
-        'npm_ttm':               npm,
-        'revenue_ttm':           revenue_ttm,
-        'revenue_growth_yoy':    revenue_growth,
-        'net_income_ttm':        net_income_ttm,
-        'net_income_growth_yoy': net_income_growth,
-        'total_assets':          total_assets,
-        'total_liabilities':     total_liabilities,
-        'total_equity':          total_equity,
-        'cash_and_equivalents':  cash_equiv,
-        'total_debt':            total_debt,
-        'debt_to_equity':        der,
-        'current_ratio':         current_ratio,
-        'free_cash_flow_ttm':    free_cash_flow,
-        'period_latest':         period_str[:20],
-        'updated_at':            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'stock_code':              stock_code,
+        'market_cap_b':            mcap_b,
+        'enterprise_value_b':      ev_b,
+        'shares_outstanding_b':    shares_out_b,
+        'free_float_pct':          free_float,
+        
+        # Valuation Ratios
+        'pe_ratio_ttm':            item_map.get('Current PE Ratio (TTM)'),
+        'pe_ratio_annualized':     item_map.get('Current PE Ratio (Annualised)'),
+        'forward_pe':              item_map.get('Forward PE Ratio'),
+        'pbv_ratio':               item_map.get('Current Price to Book Value'),
+        'ps_ratio':                item_map.get('Current Price to Sales (TTM)'),
+        'ev_ebitda':               item_map.get('EV to EBITDA (TTM)'),
+        'ev_ebit':                 item_map.get('EV to EBIT (TTM)'),
+        'peg_ratio':               item_map.get('PEG Ratio'),
+        'earnings_yield_pct':      item_map.get('Earnings Yield (TTM)'),
+        'p_fcf_ratio':             item_map.get('Current Price To Free Cashflow (TTM)'),
+
+        # Per Share
+        'eps_ttm':                 item_map.get('Current EPS (TTM)'),
+        'eps_annualized':          item_map.get('Current EPS (Annualised)'),
+        'bvps':                    item_map.get('Current Book Value Per Share'),
+        'revenue_per_share':       item_map.get('Revenue Per Share (TTM)'),
+        'cash_per_share':          item_map.get('Cash Per Share (Quarter)'),
+        'fcf_per_share':           item_map.get('Free Cashflow Per Share (TTM)'),
+
+        # Profitability & Margins
+        'roe_ttm_pct':             item_map.get('Return on Equity (TTM)'),
+        'roa_ttm_pct':             item_map.get('Return on Assets (TTM)'),
+        'roce_ttm_pct':            item_map.get('Return on Capital Employed (TTM)'),
+        'gpm_quarter_pct':         item_map.get('Gross Profit Margin (Quarter)'),
+        'opm_quarter_pct':         item_map.get('Operating Profit Margin (Quarter)'),
+        'npm_quarter_pct':         item_map.get('Net Profit Margin (Quarter)'),
+
+        # Growth
+        'revenue_growth_yoy_pct':  item_map.get('Revenue (Quarter YoY Growth)'),
+        'gross_profit_growth_yoy': item_map.get('Gross Profit (Quarter YoY Growth)'),
+        'net_income_growth_yoy':   item_map.get('Net Income (Quarter YoY Growth)'),
+
+        # Solvency & Financial Health
+        'debt_to_equity':          item_map.get('Debt to Equity Ratio (Quarter)'),
+        'current_ratio':           item_map.get('Current Ratio (Quarter)'),
+        'quick_ratio':             item_map.get('Quick Ratio (Quarter)'),
+        'interest_coverage':       item_map.get('Interest Coverage (TTM)'),
+        'piotroski_f_score':       item_map.get('Piotroski F-Score'),
+        'altman_z_score':          item_map.get('Altman Z-Score (Modified)'),
+
+        # Financial Statements (in Billion IDR)
+        'revenue_ttm_b':           item_map.get('Revenue (TTM)'),
+        'gross_profit_ttm_b':      item_map.get('Gross Profit (TTM)'),
+        'ebitda_ttm_b':            item_map.get('EBITDA (TTM)'),
+        'net_income_ttm_b':        item_map.get('Net Income (TTM)'),
+        'cash_quarter_b':          item_map.get('Cash (Quarter)'),
+        'total_assets_b':          item_map.get('Total Assets (Quarter)'),
+        'total_liabilities_b':     item_map.get('Total Liabilities (Quarter)'),
+        'total_equity_b':          item_map.get('Total Equity'),
+        'total_debt_b':            item_map.get('Total Debt (Quarter)'),
+        'net_debt_b':              item_map.get('Net Debt (Quarter)'),
+        'cash_from_ops_ttm_b':     item_map.get('Cash From Operations (TTM)'),
+        'free_cash_flow_ttm_b':    item_map.get('Free cash flow (TTM)'),
+
+        # Metadata
+        'period_latest':           latest_period,
+        'updated_at':              datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
 
 # =============================================================================
@@ -219,10 +231,10 @@ def fetch_company_keystats(headers, stock_code):
 # =============================================================================
 def main():
     print("=" * 65)
-    print("📊 STOCKBIT KEY STATS & FUNDAMENTALS PIPELINE")
+    print("📊 STOCKBIT KEY STATS & FUNDAMENTALS PIPELINE (v1/ratio)")
     print("=" * 65)
 
-    # 1. Auth & Refresh Token
+    # 1. Auth & Token
     sheets_svc = authenticate()
     token = get_or_refresh_token(sheets_svc, TOKEN_SHEET_ID)
     headers = make_headers(token)
@@ -231,53 +243,68 @@ def main():
     con = duckdb.connect(f'md:{MOTHERDUCK_DB}?motherduck_token={MOTHERDUCK_TOKEN}')
     con.execute(f"CREATE SCHEMA IF NOT EXISTS {MD_SCHEMA}")
 
-    # Create target table if not exists
     con.execute(f"""
         CREATE TABLE IF NOT EXISTS {MD_SCHEMA}.{MD_TABLE} (
             stock_code VARCHAR PRIMARY KEY,
-            market_cap DOUBLE,
-            shares_outstanding BIGINT,
+            market_cap_b DOUBLE,
+            enterprise_value_b DOUBLE,
+            shares_outstanding_b DOUBLE,
+            free_float_pct DOUBLE,
             pe_ratio_ttm DOUBLE,
             pe_ratio_annualized DOUBLE,
+            forward_pe DOUBLE,
             pbv_ratio DOUBLE,
             ps_ratio DOUBLE,
             ev_ebitda DOUBLE,
+            ev_ebit DOUBLE,
+            peg_ratio DOUBLE,
+            earnings_yield_pct DOUBLE,
+            p_fcf_ratio DOUBLE,
             eps_ttm DOUBLE,
             eps_annualized DOUBLE,
             bvps DOUBLE,
-            dps DOUBLE,
-            dividend_yield DOUBLE,
-            payout_ratio DOUBLE,
-            roe_ttm DOUBLE,
-            roa_ttm DOUBLE,
-            gpm_ttm DOUBLE,
-            opm_ttm DOUBLE,
-            npm_ttm DOUBLE,
-            revenue_ttm DOUBLE,
-            revenue_growth_yoy DOUBLE,
-            net_income_ttm DOUBLE,
+            revenue_per_share DOUBLE,
+            cash_per_share DOUBLE,
+            fcf_per_share DOUBLE,
+            roe_ttm_pct DOUBLE,
+            roa_ttm_pct DOUBLE,
+            roce_ttm_pct DOUBLE,
+            gpm_quarter_pct DOUBLE,
+            opm_quarter_pct DOUBLE,
+            npm_quarter_pct DOUBLE,
+            revenue_growth_yoy_pct DOUBLE,
+            gross_profit_growth_yoy DOUBLE,
             net_income_growth_yoy DOUBLE,
-            total_assets DOUBLE,
-            total_liabilities DOUBLE,
-            total_equity DOUBLE,
-            cash_and_equivalents DOUBLE,
-            total_debt DOUBLE,
             debt_to_equity DOUBLE,
             current_ratio DOUBLE,
-            free_cash_flow_ttm DOUBLE,
+            quick_ratio DOUBLE,
+            interest_coverage DOUBLE,
+            piotroski_f_score DOUBLE,
+            altman_z_score DOUBLE,
+            revenue_ttm_b DOUBLE,
+            gross_profit_ttm_b DOUBLE,
+            ebitda_ttm_b DOUBLE,
+            net_income_ttm_b DOUBLE,
+            cash_quarter_b DOUBLE,
+            total_assets_b DOUBLE,
+            total_liabilities_b DOUBLE,
+            total_equity_b DOUBLE,
+            total_debt_b DOUBLE,
+            net_debt_b DOUBLE,
+            cash_from_ops_ttm_b DOUBLE,
+            free_cash_flow_ttm_b DOUBLE,
             period_latest VARCHAR,
             updated_at TIMESTAMP
         )
     """)
 
-    # 3. Get Stock List
-    # Check if a custom list or limit is passed
+    # 3. Stock List
     args = sys.argv[1:]
     custom_stocks = None
     if '--stocks' in args:
         idx = args.index('--stocks')
         if idx + 1 < len(args):
-            custom_stocks = [s.strip().toUpperCase() for s in args[idx + 1].split(',')]
+            custom_stocks = [s.strip().upper() for s in args[idx + 1].split(',')]
 
     if custom_stocks:
         stocks = custom_stocks
@@ -291,7 +318,7 @@ def main():
                 stocks = stocks[:limit_n]
         print(f"📋 Total {len(stocks)} emiten akan diproses...")
 
-    # 4. Ingestion Loop
+    # 4. Extraction Loop
     results = []
     success_count = 0
     fail_count = 0
@@ -299,19 +326,19 @@ def main():
     for i, code in enumerate(stocks, 1):
         print(f"[{i}/{len(stocks)}] Fetching Key Stats {code}... ", end='', flush=True)
         try:
-            row = fetch_company_keystats(headers, code)
+            row = fetch_keystats_stock(headers, code)
             results.append(row)
             success_count += 1
-            print(f"✅ OK (PER: {row['pe_ratio_ttm'] or '-'}, PBV: {row['pbv_ratio'] or '-'}, ROE: {row['roe_ttm'] or '-'}%)")
+            print(f"✅ OK (PER: {row['pe_ratio_ttm'] or '-'}, PBV: {row['pbv_ratio'] or '-'}, ROE: {row['roe_ttm_pct'] or '-'}%)")
         except Exception as e:
             fail_count += 1
             print(f"⚠️ Gagal: {str(e)[:50]}")
 
-        # Sleep jitter to be polite to Stockbit API
-        time.sleep(0.35 + random.uniform(0.1, 0.25))
+        # Politeness delay
+        time.sleep(0.5 + random.uniform(0.1, 0.3))
 
-        # Batch insert to MotherDuck every 50 stocks or at the end
-        if len(results) >= 50 or i == len(stocks):
+        # Batch insert to MotherDuck
+        if len(results) >= 25 or i == len(stocks):
             if results:
                 import pandas as pd
                 df = pd.DataFrame(results)
@@ -321,7 +348,7 @@ def main():
                     SELECT * FROM df_batch
                 """)
                 con.unregister('df_batch')
-                print(f"   💾 [DB] Berhasil menyimpan batch {len(results)} saham ke MotherDuck!")
+                print(f"   💾 [DB] Tersimpan batch {len(results)} saham ke MotherDuck!")
                 results = []
 
     total_in_db = con.execute(f"SELECT COUNT(*) FROM {MD_SCHEMA}.{MD_TABLE}").fetchone()[0]
