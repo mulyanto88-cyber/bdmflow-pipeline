@@ -114,7 +114,12 @@ def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=N
     # 1. Trigger Paywall Eligibility check (same as browser client flow)
     pw_url = f'https://exodus.stockbit.com/paywall/eligibility/check?features=PAYWALL_FEATURE_KEYSTATS&company={stock_code}'
     try:
-        session.get(pw_url, headers=headers, timeout=8)
+        pw = session.get(pw_url, headers=headers, timeout=8)
+        try:
+            pw_body = pw.json()
+        except Exception:
+            pw_body = {'raw': pw.text[:120]}
+        print(f"[PW: {json.dumps(pw_body)[:140]}] ", end='', flush=True)
     except Exception:
         pass
 
@@ -174,6 +179,16 @@ def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=N
                 if mrq.get('quarter') and mrq.get('date'):
                     latest_period = f"{mrq.get('quarter')} ({mrq.get('date')})"
                     break
+
+            # Diagnostic: a 200 response that parses to nothing is a paywall /
+            # tier / coverage signal, not a success — print the raw shape once.
+            parsed_any = (
+                mcap_b is not None or shares_out_b is not None or ev_b is not None
+                or free_float is not None or bool(item_map)
+            )
+            if not parsed_any:
+                preview = str(res_json)[:160]
+                print(f"[Resp: {preview}] ", end='', flush=True)
 
             return {
                 'stock_code':              stock_code,
@@ -297,6 +312,7 @@ def main():
     # 4. Extraction Loop
     results = []
     success_count = 0
+    empty_count = 0
     fail_count = 0
 
     for i, code in enumerate(stocks, 1):
@@ -304,11 +320,19 @@ def main():
         try:
             row = fetch_keystats_stock(session, token, code, sheets_svc=sheets_svc, sheet_id=TOKEN_SHEET_ID)
             results.append(row)
-            success_count += 1
-            print(f"✅ OK (PER: {row['pe_ratio_ttm'] or '-'}, PBV: {row['pbv_ratio'] or '-'}, ROE: {row['roe_ttm_pct'] or '-'}%)")
+            has_any = any(
+                row.get(k) is not None
+                for k in ('pe_ratio_ttm', 'pbv_ratio', 'roe_ttm_pct', 'market_cap_b', 'free_float_pct')
+            )
+            if has_any:
+                success_count += 1
+                print(f"✅ DATA (PER: {row['pe_ratio_ttm'] or '-'}, PBV: {row['pbv_ratio'] or '-'}, ROE: {row['roe_ttm_pct'] or '-'}%)")
+            else:
+                empty_count += 1
+                print(f"⚠️ KOSONG — 200 OK tapi tidak ada data ter-parse (paywall/tier? lihat [Resp:] di atas)")
         except Exception as e:
             fail_count += 1
-            print(f"⚠️ Gagal: {str(e)[:50]}")
+            print(f"❌ Gagal: {str(e)[:50]}")
 
         # Politeness delay between stocks
         time.sleep(0.7 + random.uniform(0.1, 0.3))
@@ -340,7 +364,7 @@ def main():
 
     total_in_db = con.execute(f"SELECT COUNT(*) FROM {MD_SCHEMA}.{MD_TABLE}").fetchone()[0]
     print("=" * 65)
-    print(f"🎉 SELESAI! Sukses: {success_count} · Gagal: {fail_count}")
+    print(f"🎉 SELESAI! Data: {success_count} · KOSONG: {empty_count} · Gagal: {fail_count}")
     print(f"📊 Total emiten di {MD_SCHEMA}.{MD_TABLE}: {total_in_db} rows")
     print("=" * 65)
     con.close()
