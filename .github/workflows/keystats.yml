@@ -1,0 +1,43 @@
+name: 📊 Fundamental & Key Stats Pipeline
+
+on:
+  schedule:
+    - cron: '0 0 * * 6'  # Setiap Sabtu 07:00 WIB
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Jumlah emiten yang akan di-fetch (kosongkan untuk semua)'
+        required: false
+        default: ''
+
+concurrency:
+  group: keystats-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+      - name: Run Key Stats Pipeline
+        env:
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          TOKEN_SHEET_ID: ${{ secrets.TOKEN_SHEET_ID }}
+          STOCKBIT_USERNAME: ${{ secrets.STOCKBIT_USERNAME }}
+          STOCKBIT_PASSWORD: ${{ secrets.STOCKBIT_PASSWORD }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          if [ -n "${{ github.event.inputs.limit }}" ]; then
+            python scripts/fetch_keystats.py --limit "${{ github.event.inputs.limit }}"
+          else
+            python scripts/fetch_keystats.py
+          fi
