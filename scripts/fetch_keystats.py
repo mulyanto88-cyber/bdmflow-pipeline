@@ -283,11 +283,16 @@ def main():
     con = duckdb.connect(f'md:{MOTHERDUCK_DB}?motherduck_token={MOTHERDUCK_TOKEN}')
     con.execute(f"CREATE SCHEMA IF NOT EXISTS {MD_SCHEMA}")
 
-    # Check if existing table has outdated column count, auto drop to migrate
+    # Check if existing table has outdated column count, auto drop to migrate.
+    # EXPECTED = jumlah kolom yang dihasilkan row dict di fetch_keystats_stock
+    # (saat ini 50). Penting: angka ini HARUS sama dengan kolom aktual dict,
+    # kalau tidak tabel akan DI-DROP SETIAP RUN dan akumulasi data mingguan
+    # ikut terhapus (bug lama: 46 vs kenyataan 50 → selalu drop).
+    EXPECTED_COLS = 50
     try:
         col_count = len(con.execute(f"PRAGMA table_info('{MD_SCHEMA}.{MD_TABLE}')").fetchall())
-        if 0 < col_count != 46:
-            print(f"🔄 Menyesuaikan schema tabel {MD_SCHEMA}.{MD_TABLE} ({col_count} -> 46 kolom)...")
+        if 0 < col_count != EXPECTED_COLS:
+            print(f"🔄 Menyesuaikan schema tabel {MD_SCHEMA}.{MD_TABLE} ({col_count} -> {EXPECTED_COLS} kolom)...")
             con.execute(f"DROP TABLE {MD_SCHEMA}.{MD_TABLE}")
     except Exception:
         pass
