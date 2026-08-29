@@ -19,11 +19,15 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
       - name: Run BrokSum + Insider Pipeline
         env:
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           TOKEN_SHEET_ID: ${{ secrets.TOKEN_SHEET_ID }}
+          STOCKBIT_USERNAME: ${{ secrets.STOCKBIT_USERNAME }}
+          STOCKBIT_PASSWORD: ${{ secrets.STOCKBIT_PASSWORD }}
           PYTHONUNBUFFERED: "1"
         run: python scripts/broksum_insider.py
