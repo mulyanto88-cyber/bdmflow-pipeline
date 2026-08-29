@@ -1,8 +1,8 @@
-name: 🚀 Daily Stock Pipeline
+name: 🚀 Daily Stock Pipeline — 18:00 WIB
 
 on:
   schedule:
-    - cron: '30 11 * * 1-5'  # 18:30 WIB, Senin-Jumat
+    - cron: '0 11 * * 1-5'  # 18:00 WIB, Senin-Jumat
   workflow_dispatch:
 
 concurrency:

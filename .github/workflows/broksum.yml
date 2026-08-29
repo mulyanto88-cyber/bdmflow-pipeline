@@ -1,8 +1,8 @@
-name: 🏦 BrokSum + Insider Pipeline
+name: 🏦 BrokSum + Insider Pipeline — 17:40 WIB
 
 on:
   schedule:
-    - cron: '50 11 * * 1-5'  # 18:50 WIB, Senin-Jumat
+    - cron: '40 10 * * 1-5'  # 17:40 WIB, Senin-Jumat
   workflow_dispatch:
 
 concurrency:

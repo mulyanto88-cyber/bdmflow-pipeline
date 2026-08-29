@@ -1,8 +1,8 @@
-name: 🔄 Refresh Materialized Tables — 19:50 WIB
+name: 🔄 Refresh Materialized Tables — 18:30 WIB
 
 on:
   schedule:
-    - cron: '50 12 * * 1-5'  # 19:50 WIB, Senin-Jumat
+    - cron: '30 11 * * 1-5'  # 18:30 WIB, Senin-Jumat
   workflow_dispatch:
 
 concurrency:
@@ -532,6 +532,117 @@ jobs:
           refresh('ksei.tb_ownership_1pct_latest',    'SELECT * FROM ksei.vw_ownership_1pct_latest')
 
           # Lower priority: single-call views
+          refresh('market.tb_dominant_brokers_multiperiod', \"\"\"
+          WITH max_dt AS (
+              SELECT MAX(CAST(date AS DATE)) AS mx FROM main.broker_activity
+          ),
+          stock_prices AS (
+              SELECT stock_code, close::FLOAT8 AS curr_price
+              FROM market.vw_stock_latest
+          ),
+          periods AS (
+              SELECT '1W' AS p_code, 7 AS p_days, 1 AS p_order
+              UNION ALL SELECT '2W', 14, 2
+              UNION ALL SELECT '1M', 30, 3
+              UNION ALL SELECT '3M', 90, 4
+              UNION ALL SELECT '6M', 180, 5
+          ),
+          base_tx AS (
+              SELECT
+                  ba.stock_code,
+                  ba.broker_code,
+                  ba.broker_name,
+                  CAST(ba.date AS DATE) AS tx_date,
+                  ba.value,
+                  ba.lot
+              FROM main.broker_activity ba, max_dt m
+              WHERE CAST(ba.date AS DATE) >= m.mx - INTERVAL '180 days'
+          ),
+          broker_period_agg AS (
+              SELECT
+                  p.p_code,
+                  p.p_order,
+                  b.stock_code,
+                  b.broker_code,
+                  MAX(b.broker_name) AS broker_name,
+                  SUM(CASE WHEN b.value > 0 THEN b.value ELSE 0 END)::FLOAT8 AS buy_val,
+                  SUM(CASE WHEN b.value > 0 THEN b.lot ELSE 0 END)::FLOAT8 AS buy_lot,
+                  ABS(SUM(CASE WHEN b.value < 0 THEN b.value ELSE 0 END))::FLOAT8 AS sell_val,
+                  ABS(SUM(CASE WHEN b.value < 0 THEN b.lot ELSE 0 END))::FLOAT8 AS sell_lot,
+                  SUM(b.value)::FLOAT8 AS net_val
+              FROM periods p
+              CROSS JOIN max_dt m
+              JOIN base_tx b ON b.tx_date >= m.mx - (p.p_days || ' days')::INTERVAL
+              GROUP BY p.p_code, p.p_order, b.stock_code, b.broker_code
+          ),
+          market_turnover AS (
+              SELECT
+                  p.p_code,
+                  b.stock_code,
+                  SUM(CASE WHEN b.value > 0 THEN b.value ELSE 0 END)::FLOAT8 AS total_market_val
+              FROM periods p
+              CROSS JOIN max_dt m
+              JOIN base_tx b ON b.tx_date >= m.mx - (p.p_days || ' days')::INTERVAL
+              GROUP BY p.p_code, b.stock_code
+          ),
+          ranked_buyers AS (
+              SELECT
+                  b.*,
+                  m.total_market_val,
+                  (b.buy_val / NULLIF(b.buy_lot * 100.0, 0))::FLOAT8 AS buy_avg_price,
+                  ROUND(((b.buy_val / NULLIF(m.total_market_val, 0)) * 100)::NUMERIC, 1)::FLOAT8 AS buy_dominance_pct,
+                  sp.curr_price,
+                  ROUND((((sp.curr_price - (b.buy_val / NULLIF(b.buy_lot * 100.0, 0))) / NULLIF(b.buy_val / NULLIF(b.buy_lot * 100.0, 0), 0)) * 100)::NUMERIC, 1)::FLOAT8 AS buy_pnl_pct,
+                  ROW_NUMBER() OVER (PARTITION BY b.stock_code, b.p_code ORDER BY b.buy_val DESC NULLS LAST) AS rnk_buy
+              FROM broker_period_agg b
+              JOIN market_turnover m ON b.stock_code = m.stock_code AND b.p_code = m.p_code
+              LEFT JOIN stock_prices sp ON b.stock_code = sp.stock_code
+              WHERE b.buy_val > 0
+          ),
+          ranked_sellers AS (
+              SELECT
+                  b.*,
+                  m.total_market_val,
+                  (b.sell_val / NULLIF(b.sell_lot * 100.0, 0))::FLOAT8 AS sell_avg_price,
+                  ROUND(((b.sell_val / NULLIF(m.total_market_val, 0)) * 100)::NUMERIC, 1)::FLOAT8 AS sell_dominance_pct,
+                  ROW_NUMBER() OVER (PARTITION BY b.stock_code, b.p_code ORDER BY b.sell_val DESC NULLS LAST) AS rnk_sell
+              FROM broker_period_agg b
+              JOIN market_turnover m ON b.stock_code = m.stock_code AND b.p_code = m.p_code
+              WHERE b.sell_val > 0
+          )
+          SELECT
+              'BUYER' AS role,
+              stock_code,
+              p_code,
+              p_order,
+              broker_code,
+              broker_name,
+              buy_val AS gross_val,
+              net_val,
+              total_market_val,
+              buy_avg_price AS avg_price,
+              buy_dominance_pct AS dominance_pct,
+              buy_pnl_pct AS pnl_pct,
+              CURRENT_TIMESTAMP AS refreshed_at
+          FROM ranked_buyers WHERE rnk_buy = 1
+          UNION ALL
+          SELECT
+              'SELLER' AS role,
+              stock_code,
+              p_code,
+              p_order,
+              broker_code,
+              broker_name,
+              sell_val AS gross_val,
+              net_val,
+              total_market_val,
+              sell_avg_price AS avg_price,
+              sell_dominance_pct AS dominance_pct,
+              NULL::FLOAT8 AS pnl_pct,
+              CURRENT_TIMESTAMP AS refreshed_at
+          FROM ranked_sellers WHERE rnk_sell = 1
+          ORDER BY stock_code ASC, role ASC, p_order ASC
+          \"\"\")
           refresh('market.tb_tactical_momentum_smart_money', 'SELECT * FROM market.vw_tactical_momentum_smart_money')
           refresh('market.tb_sector_analytics',              'SELECT * FROM market.vw_sector_analytics')
           refresh('market.tb_group_leader_laggard',          'SELECT * FROM market.vw_group_leader_laggard')
