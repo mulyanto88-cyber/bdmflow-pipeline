@@ -108,7 +108,7 @@ def get_stock_codes(con):
         print(f"⚠️ Gagal ambil list dari company_profile: {e}")
         return ['BBCA', 'BBRI', 'BMRI', 'BBNI', 'ASII', 'TLKM', 'BRMS', 'AMMN', 'BRIS', 'ADRO']
 
-def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=None):
+def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=None, preview=True):
     headers = make_headers(token, stock_code)
     
     # 1. Trigger Paywall Eligibility check (same as browser client flow)
@@ -189,9 +189,9 @@ def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=N
                 mcap_b is not None or shares_out_b is not None or ev_b is not None
                 or free_float is not None or bool(item_map)
             )
-            if not parsed_any:
-                preview = str(res_json)[:400]
-                print(f"[Resp: {preview}] ", end='', flush=True)
+            if not parsed_any and preview:
+                preview_str = str(res_json)[:400]
+                print(f"[Resp: {preview_str}] ", end='', flush=True)
 
             return {
                 'stock_code':              stock_code,
@@ -339,8 +339,9 @@ def main():
             fail_count += 1
             print(f"❌ Gagal: {str(e)[:50]}")
 
-        # Politeness delay between stocks
-        time.sleep(0.7 + random.uniform(0.1, 0.3))
+        # Politeness delay between stocks — the ratio endpoint serves
+        # empty-but-200 payloads when hit too fast, so pace gently.
+        time.sleep(1.2 + random.uniform(0.2, 0.6))
 
         # Batch insert to MotherDuck
         if len(results) >= 25 or i == len(stocks):
@@ -367,32 +368,51 @@ def main():
                     print(f"   💾 [DB] Tersimpan batch {len(valid_results)} saham valid ke MotherDuck!")
                 results = []
 
-    # 5. Retry pass — throttle experiment for the KOSONG stocks.
-    # If they recover after a long pause, the endpoint is rate-limiting us and
-    # the fix is slower pacing; if they stay empty, the restriction is
-    # per-company (paywall/tier/coverage).
-    recovered = 0
-    if empty_codes:
-        print(f"\n🔁 Retry pass untuk {len(empty_codes)} saham KOSONG — jeda 20 detik dulu...")
-        time.sleep(20)
+    # 5. Retry passes — the Stockbit endpoint is cache/throttle-sensitive:
+    # ~25-33% of requests come back 200-but-empty even though eligibility is
+    # granted. Empirically, retrying LATER recovers a meaningful fraction each
+    # round (run 3: +6/18 on round 1). More rounds + longer pauses = more
+    # coverage; the table persists between weekly runs, so coverage also
+    # accumulates over time.
+    args = sys.argv[1:]
+    retry_rounds = 2
+    if '--retry-rounds' in args:
+        idx = args.index('--retry-rounds')
+        if idx + 1 < len(args):
+            try:
+                retry_rounds = max(0, min(5, int(args[idx + 1])))
+            except ValueError:
+                pass
+
+    recovered_total = 0
+    for rnd in range(1, retry_rounds + 1):
+        if not empty_codes:
+            break
+        wait = 20 if rnd == 1 else 90 * (rnd - 1)
+        print(f"\n🔁 Retry ronde {rnd}/{retry_rounds} untuk {len(empty_codes)} saham KOSONG — jeda {wait} detik...")
+        time.sleep(wait)
         retry_rows = []
+        still_empty = []
         for code in empty_codes:
             print(f"   ↻ {code}... ", end='', flush=True)
             try:
-                row = fetch_keystats_stock(session, token, code)
+                row = fetch_keystats_stock(session, token, code, preview=False)
                 has_any = any(
                     row.get(k) is not None
                     for k in ('pe_ratio_ttm', 'pbv_ratio', 'roe_ttm_pct', 'market_cap_b', 'free_float_pct')
                 )
                 if has_any:
-                    recovered += 1
+                    recovered_total += 1
                     retry_rows.append(row)
                     print(f"✅ PULIH (PER: {row['pe_ratio_ttm'] or '-'}, PBV: {row['pbv_ratio'] or '-'})")
                 else:
+                    still_empty.append(code)
                     print("masih KOSONG")
             except Exception as e:
+                still_empty.append(code)
                 print(f"gagal: {str(e)[:40]}")
             time.sleep(2.5)
+        empty_codes = still_empty
 
         if retry_rows:
             import pandas as pd
@@ -404,11 +424,11 @@ def main():
                 INSERT INTO {MD_SCHEMA}.{MD_TABLE} SELECT * FROM df_retry;
             """)
             con.unregister('df_retry')
-            print(f"   💾 [DB] Retry tersimpan {len(retry_rows)} saham pulih!")
+            print(f"   💾 [DB] Ronde {rnd} tersimpan {len(retry_rows)} saham pulih!")
 
     total_in_db = con.execute(f"SELECT COUNT(*) FROM {MD_SCHEMA}.{MD_TABLE}").fetchone()[0]
     print("=" * 65)
-    print(f"🎉 SELESAI! Data: {success_count} · KOSONG: {empty_count} · Pulih saat retry: {recovered} · Gagal: {fail_count}")
+    print(f"🎉 SELESAI! Data: {success_count} · KOSONG: {empty_count} · Pulih total (retry): {recovered_total} · Gagal: {fail_count}")
     print(f"📊 Total emiten di {MD_SCHEMA}.{MD_TABLE}: {total_in_db} rows")
     print("=" * 65)
     con.close()

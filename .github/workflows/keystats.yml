@@ -1,4 +1,4 @@
-name: 📊 Fundamental & Key Stats Pipeline
+name: Fundamental & Key Stats Pipeline
 
 on:
   schedule:
@@ -9,6 +9,10 @@ on:
         description: 'Jumlah emiten yang akan di-fetch (kosongkan untuk semua)'
         required: false
         default: ''
+      retry_rounds:
+        description: 'Ronde retry untuk saham KOSONG (0-5). Run penuh pakai 1 agar tidak melebihi timeout.'
+        required: false
+        default: '1'
 
 concurrency:
   group: keystats-pipeline
@@ -17,9 +21,9 @@ concurrency:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -36,8 +40,11 @@ jobs:
           STOCKBIT_PASSWORD: ${{ secrets.STOCKBIT_PASSWORD }}
           PYTHONUNBUFFERED: "1"
         run: |
+          ARGS=""
           if [ -n "${{ github.event.inputs.limit }}" ]; then
-            python scripts/fetch_keystats.py --limit "${{ github.event.inputs.limit }}"
-          else
-            python scripts/fetch_keystats.py
+            ARGS="$ARGS --limit ${{ github.event.inputs.limit }}"
           fi
+          if [ -n "${{ github.event.inputs.retry_rounds }}" ]; then
+            ARGS="$ARGS --retry-rounds ${{ github.event.inputs.retry_rounds }}"
+          fi
+          python scripts/fetch_keystats.py $ARGS
