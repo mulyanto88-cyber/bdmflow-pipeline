@@ -117,9 +117,12 @@ def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=N
         pw = session.get(pw_url, headers=headers, timeout=8)
         try:
             pw_body = pw.json()
+            pw_data = (pw_body or {}).get('data') or {}
+            feats = pw_data.get('features') or []
+            elig = next((f.get('is_eligible') for f in feats if isinstance(f, dict)), None)
+            print(f"[PW: eligible={elig} subs={pw_data.get('last_subscription')}] ", end='', flush=True)
         except Exception:
-            pw_body = {'raw': pw.text[:120]}
-        print(f"[PW: {json.dumps(pw_body)[:140]}] ", end='', flush=True)
+            print("[PW: ?] ", end='', flush=True)
     except Exception:
         pass
 
@@ -187,7 +190,7 @@ def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=N
                 or free_float is not None or bool(item_map)
             )
             if not parsed_any:
-                preview = str(res_json)[:160]
+                preview = str(res_json)[:400]
                 print(f"[Resp: {preview}] ", end='', flush=True)
 
             return {
@@ -311,6 +314,7 @@ def main():
 
     # 4. Extraction Loop
     results = []
+    empty_codes = []
     success_count = 0
     empty_count = 0
     fail_count = 0
@@ -329,7 +333,8 @@ def main():
                 print(f"✅ DATA (PER: {row['pe_ratio_ttm'] or '-'}, PBV: {row['pbv_ratio'] or '-'}, ROE: {row['roe_ttm_pct'] or '-'}%)")
             else:
                 empty_count += 1
-                print(f"⚠️ KOSONG — 200 OK tapi tidak ada data ter-parse (paywall/tier? lihat [Resp:] di atas)")
+                empty_codes.append(code)
+                print(f"⚠️ KOSONG — 200 OK tapi tidak ada data ter-parse (throttle? lihat [Resp:] di atas)")
         except Exception as e:
             fail_count += 1
             print(f"❌ Gagal: {str(e)[:50]}")
@@ -362,9 +367,48 @@ def main():
                     print(f"   💾 [DB] Tersimpan batch {len(valid_results)} saham valid ke MotherDuck!")
                 results = []
 
+    # 5. Retry pass — throttle experiment for the KOSONG stocks.
+    # If they recover after a long pause, the endpoint is rate-limiting us and
+    # the fix is slower pacing; if they stay empty, the restriction is
+    # per-company (paywall/tier/coverage).
+    recovered = 0
+    if empty_codes:
+        print(f"\n🔁 Retry pass untuk {len(empty_codes)} saham KOSONG — jeda 20 detik dulu...")
+        time.sleep(20)
+        retry_rows = []
+        for code in empty_codes:
+            print(f"   ↻ {code}... ", end='', flush=True)
+            try:
+                row = fetch_keystats_stock(session, token, code)
+                has_any = any(
+                    row.get(k) is not None
+                    for k in ('pe_ratio_ttm', 'pbv_ratio', 'roe_ttm_pct', 'market_cap_b', 'free_float_pct')
+                )
+                if has_any:
+                    recovered += 1
+                    retry_rows.append(row)
+                    print(f"✅ PULIH (PER: {row['pe_ratio_ttm'] or '-'}, PBV: {row['pbv_ratio'] or '-'})")
+                else:
+                    print("masih KOSONG")
+            except Exception as e:
+                print(f"gagal: {str(e)[:40]}")
+            time.sleep(2.5)
+
+        if retry_rows:
+            import pandas as pd
+            df = pd.DataFrame(retry_rows)
+            con.register('df_retry', df)
+            con.execute(f"""
+                CREATE TABLE IF NOT EXISTS {MD_SCHEMA}.{MD_TABLE} AS SELECT * FROM df_retry LIMIT 0;
+                DELETE FROM {MD_SCHEMA}.{MD_TABLE} WHERE stock_code IN (SELECT stock_code FROM df_retry);
+                INSERT INTO {MD_SCHEMA}.{MD_TABLE} SELECT * FROM df_retry;
+            """)
+            con.unregister('df_retry')
+            print(f"   💾 [DB] Retry tersimpan {len(retry_rows)} saham pulih!")
+
     total_in_db = con.execute(f"SELECT COUNT(*) FROM {MD_SCHEMA}.{MD_TABLE}").fetchone()[0]
     print("=" * 65)
-    print(f"🎉 SELESAI! Data: {success_count} · KOSONG: {empty_count} · Gagal: {fail_count}")
+    print(f"🎉 SELESAI! Data: {success_count} · KOSONG: {empty_count} · Pulih saat retry: {recovered} · Gagal: {fail_count}")
     print(f"📊 Total emiten di {MD_SCHEMA}.{MD_TABLE}: {total_in_db} rows")
     print("=" * 65)
     con.close()
