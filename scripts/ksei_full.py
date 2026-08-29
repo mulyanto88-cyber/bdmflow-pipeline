@@ -318,15 +318,19 @@ def main():
     print("\n🔄 Building ksei.monthly_snapshot from raw_df (one atomic statement)...")
     con.execute(build_transform_sql())
 
-    # Validation right after transform
+    # Validation right after transform.
+    # Column names here MUST match the transform's OUTPUT contract (lower-case,
+    # pg-compatible names — see build_transform_sql). Quoted capitals are
+    # case-sensitive in DuckDB, so the old '"Local_ID_Chg_Val"' references made
+    # this validation fail AFTER the table had already been replaced.
     val = con.execute("""
         SELECT
-          COUNT(*)                                                      AS n,
-          COUNT(*) FILTER (WHERE "Local_ID_Chg_Val"<>0
-                              OR "Foreign_CP_Chg_Val"<>0)              AS rows_with_chg,
-          COUNT(*) FILTER (WHERE Is_Split_Suspect)                      AS split_months,
-          COUNT(*) FILTER (WHERE Is_Reverse_Suspect)                    AS reverse_months,
-          COUNT(*) FILTER (WHERE Top_Buyer IS NOT NULL)                 AS rows_with_top_buyer
+          COUNT(*)                                              AS n,
+          COUNT(*) FILTER (WHERE local_id_chg_val<>0
+                              OR foreign_cp_chg_val<>0)         AS rows_with_chg,
+          COUNT(*) FILTER (WHERE is_split_suspect)              AS split_months,
+          COUNT(*) FILTER (WHERE is_reverse_suspect)            AS reverse_months,
+          COUNT(*) FILTER (WHERE top_buyer IS NOT NULL)         AS rows_with_top_buyer
         FROM ksei.monthly_snapshot
     """).fetchone()
     print(f"   ✅ transformed: {val[0]:,} rows | with_chg={val[1]:,} | "

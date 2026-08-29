@@ -9,3 +9,4 @@ pdfplumber
 requests
 pyarrow
 openpyxl
+playwright>=1.40.0

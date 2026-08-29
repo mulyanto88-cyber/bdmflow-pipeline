@@ -240,20 +240,16 @@ def main():
     print("🚀 BROKSUM + INSIDER — GitHub Actions Edition")
     print("="*60)
 
-    # 1. Auth & baca token
+    # 1. Auth & baca/refresh token otomatis
     sheets_svc = authenticate()
-    token      = read_token_from_sheet(sheets_svc)
-
-    if not token:
-        print("\n💡 CARA UPDATE TOKEN:")
-        print("   1. Buka stockbit.com di HP → Login")
-        print("   2. Tap bookmark 'Get Stockbit Token'")
-        print("   3. Copy token yang muncul")
-        print("   4. Buka Google Sheet BDMFlow-Token → paste di cell A1")
-        raise SystemExit("❌ Token tidak tersedia — update di Google Sheet")
-
-    if not validate_token(token):
-        raise SystemExit("❌ Token expired — update di Google Sheet")
+    try:
+        from stockbit_auth import get_or_refresh_token
+        token = get_or_refresh_token(sheets_svc, TOKEN_SHEET_ID)
+    except Exception as e:
+        print(f"⚠️ Auto-login/refresh exception: {e}. Mencoba fallback baca manual...")
+        token = read_token_from_sheet(sheets_svc)
+        if not token or not validate_token(token):
+            raise SystemExit("❌ Token expired/tidak tersedia dan auto-login gagal. Update di Google Sheet.")
 
     headers = make_headers(token)
 
