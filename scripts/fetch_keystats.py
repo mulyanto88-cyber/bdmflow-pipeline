@@ -51,19 +51,6 @@ def make_headers(token):
     }
 
 def clean_val(val_str):
-    """
-    Parses Stockbit formatted value strings to float.
-    Examples:
-      '239.09'      -> 239.09
-      '0.63%'       -> 0.63
-      '-17.58%'     -> -17.58
-      '(1,614 B)'   -> -1614.0
-      '3,777 B'     -> 3777.0
-      '(4.63 M)'    -> -4.63
-      '141.78 B'    -> 141.78
-      '106,338 B'   -> 106338.0
-      '-' / '' / N/A-> None
-    """
     if val_str is None:
         return None
     s = str(val_str).strip()
@@ -78,9 +65,7 @@ def clean_val(val_str):
         is_negative = True
         s = s[1:].strip()
 
-    # Remove unit suffixes and commas
     s = s.replace(',', '').replace('%', '').replace('+', '').strip()
-    # Remove 'B', 'M', 'T', 'K' if attached
     s = re.sub(r'[BMTK]$', '', s).strip()
 
     try:
@@ -90,7 +75,6 @@ def clean_val(val_str):
         return None
 
 def get_stock_codes(con):
-    """Fetches list of active stocks from daily_transactions or company_profile."""
     try:
         rows = con.execute("""
             SELECT DISTINCT stock_code
@@ -118,15 +102,10 @@ def get_stock_codes(con):
         return ['BBCA', 'BBRI', 'BMRI', 'BBNI', 'ASII', 'TLKM', 'BRMS', 'AMMN', 'BRIS', 'ADRO']
 
 def fetch_keystats_stock(headers, stock_code):
-    """
-    Calls https://exodus.stockbit.com/keystats/ratio/v1/{stock_code}?year_limit=10
-    and parses all sections into a flat record.
-    """
     url = f'{BASE_URL}/{stock_code}?year_limit=10'
     r = requests.get(url, headers=headers, timeout=20)
     
     if r.status_code == 429:
-        # Rate limit hit, wait and retry once
         time.sleep(5)
         r = requests.get(url, headers=headers, timeout=20)
 
@@ -134,14 +113,12 @@ def fetch_keystats_stock(headers, stock_code):
     res_json = r.json()
     data = res_json.get('data', {})
 
-    # 1. Stats header
     stats = data.get('stats', {})
     mcap_b        = clean_val(stats.get('market_cap'))
     shares_out_b  = clean_val(stats.get('current_share_outstanding'))
     ev_b          = clean_val(stats.get('enterprise_value'))
     free_float    = clean_val(stats.get('free_float'))
 
-    # 2. Key Stats Groups
     item_map = {}
     for group in data.get('closure_fin_items_results', []):
         for sub in group.get('fin_name_results', []):
@@ -151,7 +128,6 @@ def fetch_keystats_stock(headers, stock_code):
             if name:
                 item_map[name.strip()] = clean_val(val)
 
-    # 3. Latest Financial Quarter
     latest_period = 'Latest'
     for group in data.get('financial_year_parent', {}).get('financial_year_groups', []):
         mrq = group.get('most_recent_quarter', {})
@@ -243,60 +219,14 @@ def main():
     con = duckdb.connect(f'md:{MOTHERDUCK_DB}?motherduck_token={MOTHERDUCK_TOKEN}')
     con.execute(f"CREATE SCHEMA IF NOT EXISTS {MD_SCHEMA}")
 
-    con.execute(f"""
-        CREATE TABLE IF NOT EXISTS {MD_SCHEMA}.{MD_TABLE} (
-            stock_code VARCHAR PRIMARY KEY,
-            market_cap_b DOUBLE,
-            enterprise_value_b DOUBLE,
-            shares_outstanding_b DOUBLE,
-            free_float_pct DOUBLE,
-            pe_ratio_ttm DOUBLE,
-            pe_ratio_annualized DOUBLE,
-            forward_pe DOUBLE,
-            pbv_ratio DOUBLE,
-            ps_ratio DOUBLE,
-            ev_ebitda DOUBLE,
-            ev_ebit DOUBLE,
-            peg_ratio DOUBLE,
-            earnings_yield_pct DOUBLE,
-            p_fcf_ratio DOUBLE,
-            eps_ttm DOUBLE,
-            eps_annualized DOUBLE,
-            bvps DOUBLE,
-            revenue_per_share DOUBLE,
-            cash_per_share DOUBLE,
-            fcf_per_share DOUBLE,
-            roe_ttm_pct DOUBLE,
-            roa_ttm_pct DOUBLE,
-            roce_ttm_pct DOUBLE,
-            gpm_quarter_pct DOUBLE,
-            opm_quarter_pct DOUBLE,
-            npm_quarter_pct DOUBLE,
-            revenue_growth_yoy_pct DOUBLE,
-            gross_profit_growth_yoy DOUBLE,
-            net_income_growth_yoy DOUBLE,
-            debt_to_equity DOUBLE,
-            current_ratio DOUBLE,
-            quick_ratio DOUBLE,
-            interest_coverage DOUBLE,
-            piotroski_f_score DOUBLE,
-            altman_z_score DOUBLE,
-            revenue_ttm_b DOUBLE,
-            gross_profit_ttm_b DOUBLE,
-            ebitda_ttm_b DOUBLE,
-            net_income_ttm_b DOUBLE,
-            cash_quarter_b DOUBLE,
-            total_assets_b DOUBLE,
-            total_liabilities_b DOUBLE,
-            total_equity_b DOUBLE,
-            total_debt_b DOUBLE,
-            net_debt_b DOUBLE,
-            cash_from_ops_ttm_b DOUBLE,
-            free_cash_flow_ttm_b DOUBLE,
-            period_latest VARCHAR,
-            updated_at TIMESTAMP
-        )
-    """)
+    # Check if existing table has outdated column count, auto drop to migrate
+    try:
+        col_count = len(con.execute(f"PRAGMA table_info('{MD_SCHEMA}.{MD_TABLE}')").fetchall())
+        if 0 < col_count != 46:
+            print(f"🔄 Menyesuaikan schema tabel {MD_SCHEMA}.{MD_TABLE} ({col_count} -> 46 kolom)...")
+            con.execute(f"DROP TABLE {MD_SCHEMA}.{MD_TABLE}")
+    except Exception:
+        pass
 
     # 3. Stock List
     args = sys.argv[1:]
@@ -344,8 +274,9 @@ def main():
                 df = pd.DataFrame(results)
                 con.register('df_batch', df)
                 con.execute(f"""
-                    INSERT OR REPLACE INTO {MD_SCHEMA}.{MD_TABLE}
-                    SELECT * FROM df_batch
+                    CREATE TABLE IF NOT EXISTS {MD_SCHEMA}.{MD_TABLE} AS SELECT * FROM df_batch LIMIT 0;
+                    DELETE FROM {MD_SCHEMA}.{MD_TABLE} WHERE stock_code IN (SELECT stock_code FROM df_batch);
+                    INSERT INTO {MD_SCHEMA}.{MD_TABLE} SELECT * FROM df_batch;
                 """)
                 con.unregister('df_batch')
                 print(f"   💾 [DB] Tersimpan batch {len(results)} saham ke MotherDuck!")
