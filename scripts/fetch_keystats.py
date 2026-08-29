@@ -41,13 +41,20 @@ def authenticate():
     )
     return build('sheets', 'v4', credentials=creds, cache_discovery=False)
 
-def make_headers(token):
+def make_headers(token, stock_code=None):
+    ref = f'https://stockbit.com/symbol/{stock_code}/keystats' if stock_code else 'https://stockbit.com/'
     return {
-        'Authorization': f'Bearer {token}',
-        'Accept':        'application/json',
-        'User-Agent':    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Referer':       'https://stockbit.com/',
-        'Origin':        'https://stockbit.com',
+        'Authorization':   f'Bearer {token}',
+        'Accept':          'application/json, text/plain, */*',
+        'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Referer':         ref,
+        'Origin':          'https://stockbit.com',
+        'sec-ch-ua':       '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        'sec-ch-ua-mobile':'?0',
+        'sec-ch-ua-platform':'"Windows"',
+        'sec-fetch-dest':  'empty',
+        'sec-fetch-mode':  'cors',
+        'sec-fetch-site':  'same-site',
     }
 
 def clean_val(val_str):
@@ -101,23 +108,33 @@ def get_stock_codes(con):
         print(f"⚠️ Gagal ambil list dari company_profile: {e}")
         return ['BBCA', 'BBRI', 'BMRI', 'BBNI', 'ASII', 'TLKM', 'BRMS', 'AMMN', 'BRIS', 'ADRO']
 
-def fetch_keystats_stock(headers, stock_code, sheets_svc=None, sheet_id=None):
+def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=None):
+    headers = make_headers(token, stock_code)
+    
+    # 1. Trigger Paywall Eligibility check (same as browser client flow)
+    pw_url = f'https://exodus.stockbit.com/paywall/eligibility/check?features=PAYWALL_FEATURE_KEYSTATS&company={stock_code}'
+    try:
+        session.get(pw_url, headers=headers, timeout=8)
+    except Exception:
+        pass
+
+    # 2. Fetch Key Stats
     url = f'{BASE_URL}/{stock_code}?year_limit=10'
     
     for attempt in range(3):
         try:
-            r = requests.get(url, headers=headers, timeout=20)
+            r = session.get(url, headers=headers, timeout=20)
             
-            # Auto-refresh token if expired mid-run
+            # Auto-refresh token if 401/403
             if r.status_code in (401, 403) and sheets_svc and sheet_id:
                 print(f"\n🔄 Token refresh otomatis untuk {stock_code}...", end='', flush=True)
                 new_token = get_or_refresh_token(sheets_svc, sheet_id)
-                headers['Authorization'] = f'Bearer {new_token}'
+                headers = make_headers(new_token, stock_code)
                 time.sleep(2)
                 continue
 
             if r.status_code == 429:
-                time.sleep(4 + attempt * 3)
+                time.sleep(5 + attempt * 3)
                 continue
 
             r.raise_for_status()
@@ -127,11 +144,15 @@ def fetch_keystats_stock(headers, stock_code, sheets_svc=None, sheet_id=None):
             stats = data.get('stats') or {}
             closure_results = data.get('closure_fin_items_results') or []
 
-            # If payload is empty due to temporary throttle, retry
+            # If payload is empty, log preview and retry
             if not stats and not closure_results:
                 if attempt < 2:
                     time.sleep(2 + attempt * 2)
                     continue
+                else:
+                    # Log response diagnostic
+                    preview = str(res_json)[:120]
+                    print(f"[Resp: {preview}] ", end='', flush=True)
 
             mcap_b        = clean_val(stats.get('market_cap'))
             shares_out_b  = clean_val(stats.get('current_share_outstanding'))
@@ -236,7 +257,9 @@ def main():
     # 1. Auth & Token
     sheets_svc = authenticate()
     token = get_or_refresh_token(sheets_svc, TOKEN_SHEET_ID)
-    headers = make_headers(token)
+
+    # Persistent HTTP Session
+    session = requests.Session()
 
     # 2. Connect MotherDuck
     con = duckdb.connect(f'md:{MOTHERDUCK_DB}?motherduck_token={MOTHERDUCK_TOKEN}')
@@ -279,7 +302,7 @@ def main():
     for i, code in enumerate(stocks, 1):
         print(f"[{i}/{len(stocks)}] Fetching Key Stats {code}... ", end='', flush=True)
         try:
-            row = fetch_keystats_stock(headers, code, sheets_svc=sheets_svc, sheet_id=TOKEN_SHEET_ID)
+            row = fetch_keystats_stock(session, token, code, sheets_svc=sheets_svc, sheet_id=TOKEN_SHEET_ID)
             results.append(row)
             success_count += 1
             print(f"✅ OK (PER: {row['pe_ratio_ttm'] or '-'}, PBV: {row['pbv_ratio'] or '-'}, ROE: {row['roe_ttm_pct'] or '-'}%)")
