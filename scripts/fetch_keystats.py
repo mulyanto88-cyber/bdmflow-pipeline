@@ -293,16 +293,26 @@ def main():
         # Batch insert to MotherDuck
         if len(results) >= 25 or i == len(stocks):
             if results:
-                import pandas as pd
-                df = pd.DataFrame(results)
-                con.register('df_batch', df)
-                con.execute(f"""
-                    CREATE TABLE IF NOT EXISTS {MD_SCHEMA}.{MD_TABLE} AS SELECT * FROM df_batch LIMIT 0;
-                    DELETE FROM {MD_SCHEMA}.{MD_TABLE} WHERE stock_code IN (SELECT stock_code FROM df_batch);
-                    INSERT INTO {MD_SCHEMA}.{MD_TABLE} SELECT * FROM df_batch;
-                """)
-                con.unregister('df_batch')
-                print(f"   💾 [DB] Tersimpan batch {len(results)} saham ke MotherDuck!")
+                # Only insert valid records so failures never wipe existing data
+                valid_results = [
+                    r for r in results 
+                    if r.get('pe_ratio_ttm') is not None 
+                    or r.get('pbv_ratio') is not None 
+                    or r.get('roe_ttm_pct') is not None 
+                    or r.get('market_cap_b') is not None
+                    or r.get('free_float_pct') is not None
+                ]
+                if valid_results:
+                    import pandas as pd
+                    df = pd.DataFrame(valid_results)
+                    con.register('df_batch', df)
+                    con.execute(f"""
+                        CREATE TABLE IF NOT EXISTS {MD_SCHEMA}.{MD_TABLE} AS SELECT * FROM df_batch LIMIT 0;
+                        DELETE FROM {MD_SCHEMA}.{MD_TABLE} WHERE stock_code IN (SELECT stock_code FROM df_batch);
+                        INSERT INTO {MD_SCHEMA}.{MD_TABLE} SELECT * FROM df_batch;
+                    """)
+                    con.unregister('df_batch')
+                    print(f"   💾 [DB] Tersimpan batch {len(valid_results)} saham valid ke MotherDuck!")
                 results = []
 
     total_in_db = con.execute(f"SELECT COUNT(*) FROM {MD_SCHEMA}.{MD_TABLE}").fetchone()[0]

@@ -9,7 +9,7 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 def validate_token(token: str) -> bool:
-    """Check if JWT token is still valid with at least 1 hour remaining."""
+    """Check if JWT token is still valid and verified against Stockbit backend."""
     if not token or len(token) < 30:
         return False
     try:
@@ -20,12 +20,30 @@ def validate_token(token: str) -> bool:
         body = json.loads(base64.b64decode(parts[1] + '=' * (pad % 4)))
         exp = body.get('exp', 0)
         sisa = exp - datetime.now().timestamp()
-        if sisa <= 3600:  # If less than 1 hour remaining, treat as expired
+        if sisa <= 1800:  # If less than 30 mins remaining, refresh
+            print("⏳ Token mendekati masa kedaluwarsa (<30 menit).")
             return False
-        h, m = int(sisa // 3600), int((sisa % 3600) // 60)
-        print(f"✅ Token masih aktif ({h}j {m}m tersisa).")
-        return True
-    except Exception:
+        
+        # Test active connection to Stockbit Exodus
+        import requests
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        }
+        r = requests.get('https://exodus.stockbit.com/keystats/ratio/v1/BBCA?year_limit=10', headers=headers, timeout=8)
+        if r.status_code == 200:
+            data = r.json().get('data') or {}
+            # Verify data is actually returned (not empty paywalled/unauth)
+            if data.get('stats') or data.get('closure_fin_items_results'):
+                h, m = int(sisa // 3600), int((sisa % 3600) // 60)
+                print(f"✅ Token terverifikasi AKTIF & VALID di server Stockbit ({h}j {m}m tersisa).")
+                return True
+
+        print("⚠️ Token di Google Sheet sudah tidak valid / unauthorized di server Stockbit.")
+        return False
+    except Exception as e:
+        print(f"⚠️ Error saat verifikasi token: {e}")
         return False
 
 def write_token_to_sheet(sheets_service, sheet_id: str, token: str):
