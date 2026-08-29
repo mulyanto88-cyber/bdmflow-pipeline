@@ -101,106 +101,129 @@ def get_stock_codes(con):
         print(f"⚠️ Gagal ambil list dari company_profile: {e}")
         return ['BBCA', 'BBRI', 'BMRI', 'BBNI', 'ASII', 'TLKM', 'BRMS', 'AMMN', 'BRIS', 'ADRO']
 
-def fetch_keystats_stock(headers, stock_code):
+def fetch_keystats_stock(headers, stock_code, sheets_svc=None, sheet_id=None):
     url = f'{BASE_URL}/{stock_code}?year_limit=10'
-    r = requests.get(url, headers=headers, timeout=20)
     
-    if r.status_code == 429:
-        time.sleep(5)
-        r = requests.get(url, headers=headers, timeout=20)
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            
+            # Auto-refresh token if expired mid-run
+            if r.status_code in (401, 403) and sheets_svc and sheet_id:
+                print(f"\n🔄 Token refresh otomatis untuk {stock_code}...", end='', flush=True)
+                new_token = get_or_refresh_token(sheets_svc, sheet_id)
+                headers['Authorization'] = f'Bearer {new_token}'
+                time.sleep(2)
+                continue
 
-    r.raise_for_status()
-    res_json = r.json()
-    data = res_json.get('data', {})
+            if r.status_code == 429:
+                time.sleep(4 + attempt * 3)
+                continue
 
-    stats = data.get('stats', {})
-    mcap_b        = clean_val(stats.get('market_cap'))
-    shares_out_b  = clean_val(stats.get('current_share_outstanding'))
-    ev_b          = clean_val(stats.get('enterprise_value'))
-    free_float    = clean_val(stats.get('free_float'))
+            r.raise_for_status()
+            res_json = r.json()
+            data = res_json.get('data') or {}
 
-    item_map = {}
-    for group in data.get('closure_fin_items_results', []):
-        for sub in group.get('fin_name_results', []):
-            fitem = sub.get('fitem', {})
-            name = fitem.get('name')
-            val = fitem.get('value')
-            if name:
-                item_map[name.strip()] = clean_val(val)
+            stats = data.get('stats') or {}
+            closure_results = data.get('closure_fin_items_results') or []
 
-    latest_period = 'Latest'
-    for group in data.get('financial_year_parent', {}).get('financial_year_groups', []):
-        mrq = group.get('most_recent_quarter', {})
-        if mrq.get('quarter') and mrq.get('date'):
-            latest_period = f"{mrq.get('quarter')} ({mrq.get('date')})"
-            break
+            # If payload is empty due to temporary throttle, retry
+            if not stats and not closure_results:
+                if attempt < 2:
+                    time.sleep(2 + attempt * 2)
+                    continue
 
-    return {
-        'stock_code':              stock_code,
-        'market_cap_b':            mcap_b,
-        'enterprise_value_b':      ev_b,
-        'shares_outstanding_b':    shares_out_b,
-        'free_float_pct':          free_float,
-        
-        # Valuation Ratios
-        'pe_ratio_ttm':            item_map.get('Current PE Ratio (TTM)'),
-        'pe_ratio_annualized':     item_map.get('Current PE Ratio (Annualised)'),
-        'forward_pe':              item_map.get('Forward PE Ratio'),
-        'pbv_ratio':               item_map.get('Current Price to Book Value'),
-        'ps_ratio':                item_map.get('Current Price to Sales (TTM)'),
-        'ev_ebitda':               item_map.get('EV to EBITDA (TTM)'),
-        'ev_ebit':                 item_map.get('EV to EBIT (TTM)'),
-        'peg_ratio':               item_map.get('PEG Ratio'),
-        'earnings_yield_pct':      item_map.get('Earnings Yield (TTM)'),
-        'p_fcf_ratio':             item_map.get('Current Price To Free Cashflow (TTM)'),
+            mcap_b        = clean_val(stats.get('market_cap'))
+            shares_out_b  = clean_val(stats.get('current_share_outstanding'))
+            ev_b          = clean_val(stats.get('enterprise_value'))
+            free_float    = clean_val(stats.get('free_float'))
 
-        # Per Share
-        'eps_ttm':                 item_map.get('Current EPS (TTM)'),
-        'eps_annualized':          item_map.get('Current EPS (Annualised)'),
-        'bvps':                    item_map.get('Current Book Value Per Share'),
-        'revenue_per_share':       item_map.get('Revenue Per Share (TTM)'),
-        'cash_per_share':          item_map.get('Cash Per Share (Quarter)'),
-        'fcf_per_share':           item_map.get('Free Cashflow Per Share (TTM)'),
+            item_map = {}
+            for group in closure_results:
+                for sub in group.get('fin_name_results', []):
+                    fitem = sub.get('fitem', {})
+                    name = fitem.get('name')
+                    val = fitem.get('value')
+                    if name:
+                        item_map[name.strip()] = clean_val(val)
 
-        # Profitability & Margins
-        'roe_ttm_pct':             item_map.get('Return on Equity (TTM)'),
-        'roa_ttm_pct':             item_map.get('Return on Assets (TTM)'),
-        'roce_ttm_pct':            item_map.get('Return on Capital Employed (TTM)'),
-        'gpm_quarter_pct':         item_map.get('Gross Profit Margin (Quarter)'),
-        'opm_quarter_pct':         item_map.get('Operating Profit Margin (Quarter)'),
-        'npm_quarter_pct':         item_map.get('Net Profit Margin (Quarter)'),
+            latest_period = 'Latest'
+            for group in data.get('financial_year_parent', {}).get('financial_year_groups', []):
+                mrq = group.get('most_recent_quarter', {})
+                if mrq.get('quarter') and mrq.get('date'):
+                    latest_period = f"{mrq.get('quarter')} ({mrq.get('date')})"
+                    break
 
-        # Growth
-        'revenue_growth_yoy_pct':  item_map.get('Revenue (Quarter YoY Growth)'),
-        'gross_profit_growth_yoy': item_map.get('Gross Profit (Quarter YoY Growth)'),
-        'net_income_growth_yoy':   item_map.get('Net Income (Quarter YoY Growth)'),
+            return {
+                'stock_code':              stock_code,
+                'market_cap_b':            mcap_b,
+                'enterprise_value_b':      ev_b,
+                'shares_outstanding_b':    shares_out_b,
+                'free_float_pct':          free_float,
+                
+                # Valuation Ratios
+                'pe_ratio_ttm':            item_map.get('Current PE Ratio (TTM)'),
+                'pe_ratio_annualized':     item_map.get('Current PE Ratio (Annualised)'),
+                'forward_pe':              item_map.get('Forward PE Ratio'),
+                'pbv_ratio':               item_map.get('Current Price to Book Value'),
+                'ps_ratio':                item_map.get('Current Price to Sales (TTM)'),
+                'ev_ebitda':               item_map.get('EV to EBITDA (TTM)'),
+                'ev_ebit':                 item_map.get('EV to EBIT (TTM)'),
+                'peg_ratio':               item_map.get('PEG Ratio'),
+                'earnings_yield_pct':      item_map.get('Earnings Yield (TTM)'),
+                'p_fcf_ratio':             item_map.get('Current Price To Free Cashflow (TTM)'),
 
-        # Solvency & Financial Health
-        'debt_to_equity':          item_map.get('Debt to Equity Ratio (Quarter)'),
-        'current_ratio':           item_map.get('Current Ratio (Quarter)'),
-        'quick_ratio':             item_map.get('Quick Ratio (Quarter)'),
-        'interest_coverage':       item_map.get('Interest Coverage (TTM)'),
-        'piotroski_f_score':       item_map.get('Piotroski F-Score'),
-        'altman_z_score':          item_map.get('Altman Z-Score (Modified)'),
+                # Per Share
+                'eps_ttm':                 item_map.get('Current EPS (TTM)'),
+                'eps_annualized':          item_map.get('Current EPS (Annualised)'),
+                'bvps':                    item_map.get('Current Book Value Per Share'),
+                'revenue_per_share':       item_map.get('Revenue Per Share (TTM)'),
+                'cash_per_share':          item_map.get('Cash Per Share (Quarter)'),
+                'fcf_per_share':           item_map.get('Free Cashflow Per Share (TTM)'),
 
-        # Financial Statements (in Billion IDR)
-        'revenue_ttm_b':           item_map.get('Revenue (TTM)'),
-        'gross_profit_ttm_b':      item_map.get('Gross Profit (TTM)'),
-        'ebitda_ttm_b':            item_map.get('EBITDA (TTM)'),
-        'net_income_ttm_b':        item_map.get('Net Income (TTM)'),
-        'cash_quarter_b':          item_map.get('Cash (Quarter)'),
-        'total_assets_b':          item_map.get('Total Assets (Quarter)'),
-        'total_liabilities_b':     item_map.get('Total Liabilities (Quarter)'),
-        'total_equity_b':          item_map.get('Total Equity'),
-        'total_debt_b':            item_map.get('Total Debt (Quarter)'),
-        'net_debt_b':              item_map.get('Net Debt (Quarter)'),
-        'cash_from_ops_ttm_b':     item_map.get('Cash From Operations (TTM)'),
-        'free_cash_flow_ttm_b':    item_map.get('Free cash flow (TTM)'),
+                # Profitability & Margins
+                'roe_ttm_pct':             item_map.get('Return on Equity (TTM)'),
+                'roa_ttm_pct':             item_map.get('Return on Assets (TTM)'),
+                'roce_ttm_pct':            item_map.get('Return on Capital Employed (TTM)'),
+                'gpm_quarter_pct':         item_map.get('Gross Profit Margin (Quarter)'),
+                'opm_quarter_pct':         item_map.get('Operating Profit Margin (Quarter)'),
+                'npm_quarter_pct':         item_map.get('Net Profit Margin (Quarter)'),
 
-        # Metadata
-        'period_latest':           latest_period,
-        'updated_at':              datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-    }
+                # Growth
+                'revenue_growth_yoy_pct':  item_map.get('Revenue (Quarter YoY Growth)'),
+                'gross_profit_growth_yoy': item_map.get('Gross Profit (Quarter YoY Growth)'),
+                'net_income_growth_yoy':   item_map.get('Net Income (Quarter YoY Growth)'),
+
+                # Solvency & Financial Health
+                'debt_to_equity':          item_map.get('Debt to Equity Ratio (Quarter)'),
+                'current_ratio':           item_map.get('Current Ratio (Quarter)'),
+                'quick_ratio':             item_map.get('Quick Ratio (Quarter)'),
+                'interest_coverage':       item_map.get('Interest Coverage (TTM)'),
+                'piotroski_f_score':       item_map.get('Piotroski F-Score'),
+                'altman_z_score':          item_map.get('Altman Z-Score (Modified)'),
+
+                # Financial Statements (in Billion IDR)
+                'revenue_ttm_b':           item_map.get('Revenue (TTM)'),
+                'gross_profit_ttm_b':      item_map.get('Gross Profit (TTM)'),
+                'ebitda_ttm_b':            item_map.get('EBITDA (TTM)'),
+                'net_income_ttm_b':        item_map.get('Net Income (TTM)'),
+                'cash_quarter_b':          item_map.get('Cash (Quarter)'),
+                'total_assets_b':          item_map.get('Total Assets (Quarter)'),
+                'total_liabilities_b':     item_map.get('Total Liabilities (Quarter)'),
+                'total_equity_b':          item_map.get('Total Equity'),
+                'total_debt_b':            item_map.get('Total Debt (Quarter)'),
+                'net_debt_b':              item_map.get('Net Debt (Quarter)'),
+                'cash_from_ops_ttm_b':     item_map.get('Cash From Operations (TTM)'),
+                'free_cash_flow_ttm_b':    item_map.get('Free cash flow (TTM)'),
+
+                # Metadata
+                'period_latest':           latest_period,
+                'updated_at':              datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            }
+        except Exception as e:
+            if attempt == 2:
+                raise e
+            time.sleep(2)
 
 # =============================================================================
 # MAIN
@@ -256,7 +279,7 @@ def main():
     for i, code in enumerate(stocks, 1):
         print(f"[{i}/{len(stocks)}] Fetching Key Stats {code}... ", end='', flush=True)
         try:
-            row = fetch_keystats_stock(headers, code)
+            row = fetch_keystats_stock(headers, code, sheets_svc=sheets_svc, sheet_id=TOKEN_SHEET_ID)
             results.append(row)
             success_count += 1
             print(f"✅ OK (PER: {row['pe_ratio_ttm'] or '-'}, PBV: {row['pbv_ratio'] or '-'}, ROE: {row['roe_ttm_pct'] or '-'}%)")
@@ -264,8 +287,8 @@ def main():
             fail_count += 1
             print(f"⚠️ Gagal: {str(e)[:50]}")
 
-        # Politeness delay
-        time.sleep(0.5 + random.uniform(0.1, 0.3))
+        # Politeness delay between stocks
+        time.sleep(0.7 + random.uniform(0.1, 0.3))
 
         # Batch insert to MotherDuck
         if len(results) >= 25 or i == len(stocks):
