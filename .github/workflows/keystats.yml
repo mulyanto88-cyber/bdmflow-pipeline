@@ -2,15 +2,15 @@ name: Fundamental & Key Stats Pipeline
 
 on:
   schedule:
-    - cron: '0 0 * * 6'  # Setiap Sabtu 07:00 WIB
+    - cron: '0 0,4,8,12,16,20 * * *'  # 6x sehari: 07:00, 11:00, 15:00, 19:00, 23:00, 03:00 WIB
   workflow_dispatch:
     inputs:
       limit:
-        description: 'Jumlah emiten yang akan di-fetch (kosongkan untuk semua)'
+        description: 'Override jumlah saham per run (kosongkan = 120 rolling update)'
         required: false
         default: ''
       retry_rounds:
-        description: 'Ronde retry untuk saham KOSONG (0-5). Run penuh pakai 1 agar tidak melebihi timeout.'
+        description: 'Ronde retry untuk saham KOSONG (0-5).'
         required: false
         default: '1'
 

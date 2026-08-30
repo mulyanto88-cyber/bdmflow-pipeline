@@ -38,9 +38,10 @@ MD_SCHEMA        = 'market'
 MD_TABLE         = 'company_keystats'
 BASE_URL         = 'https://exodus.stockbit.com/keystats/ratio/v1'
 
-BURST_SIZE       = 45   # Max requests before Stockbit throttles
-COOLDOWN_SECS    = 60   # Seconds to wait between bursts for rate-limit reset
+BURST_SIZE       = 40   # Max requests before Stockbit throttles
+COOLDOWN_SECS    = 30   # Seconds to wait between bursts for rate-limit reset
 INTER_REQ_DELAY  = 1.3  # Seconds between individual requests within a burst
+RUN_LIMIT        = 120  # Total stocks to fetch per run in Rolling Update mode
 
 # All 50 columns in the exact order they exist in MotherDuck.
 DB_COLUMNS = [
@@ -109,40 +110,47 @@ def clean_val(val_str):
     except Exception:
         return None
 
-def get_stock_codes(con):
+def get_stale_stock_codes(con, limit=120):
+    """Fetch the most stale stocks (oldest updated_at or missing) for rolling update."""
     try:
-        rows = con.execute("""
-            SELECT DISTINCT stock_code
-            FROM market.daily_transactions
-            WHERE stock_code NOT IN ('COMPOSITE', 'IHSG', 'IDX30', 'LQ45')
-              AND stock_code IS NOT NULL AND LENGTH(stock_code) = 4
-            ORDER BY stock_code ASC
+        rows = con.execute(f"""
+            WITH canonical_stocks AS (
+                SELECT DISTINCT stock_code
+                FROM market.company_profile
+                WHERE stock_code IS NOT NULL AND LENGTH(stock_code) = 4
+            )
+            SELECT c.stock_code
+            FROM canonical_stocks c
+            LEFT JOIN {MD_SCHEMA}.{MD_TABLE} k ON c.stock_code = k.stock_code
+            ORDER BY k.updated_at ASC NULLS FIRST
+            LIMIT {limit}
         """).fetchall()
         if rows:
             return [r[0] for r in rows]
     except Exception as e:
-        print(f"⚠️ Gagal ambil list dari daily_transactions: {e}")
-    try:
-        rows = con.execute("""
-            SELECT DISTINCT stock_code FROM market.company_profile
-            WHERE stock_code IS NOT NULL ORDER BY stock_code ASC
-        """).fetchall()
-        return [r[0] for r in rows]
-    except Exception as e:
-        print(f"⚠️ Gagal ambil list dari company_profile: {e}")
-        return ['BBCA', 'BBRI', 'BMRI', 'BBNI', 'ASII', 'TLKM', 'BRMS', 'AMMN', 'BRIS', 'ADRO']
-
-def get_existing_codes(con):
-    """Return set of stock codes that already have valid data in the DB."""
+        print(f"⚠️ Gagal ambil list stale stocks: {e}")
+        
+    # Fallback if company_profile fails
     try:
         rows = con.execute(f"""
-            SELECT stock_code FROM {MD_SCHEMA}.{MD_TABLE}
-            WHERE pe_ratio_ttm IS NOT NULL OR pbv_ratio IS NOT NULL
-               OR roe_ttm_pct IS NOT NULL OR market_cap_b IS NOT NULL
+            WITH canonical_stocks AS (
+                SELECT DISTINCT stock_code
+                FROM market.daily_transactions
+                WHERE stock_code NOT IN ('COMPOSITE', 'IHSG', 'IDX30', 'LQ45')
+                  AND stock_code IS NOT NULL AND LENGTH(stock_code) = 4
+            )
+            SELECT c.stock_code
+            FROM canonical_stocks c
+            LEFT JOIN {MD_SCHEMA}.{MD_TABLE} k ON c.stock_code = k.stock_code
+            ORDER BY k.updated_at ASC NULLS FIRST
+            LIMIT {limit}
         """).fetchall()
-        return {r[0] for r in rows}
-    except Exception:
-        return set()
+        if rows:
+            return [r[0] for r in rows]
+    except Exception as e:
+        print(f"⚠️ Gagal ambil list stale stocks fallback: {e}")
+        return []
+
 
 def fetch_one(session, token, stock_code, sheets_svc=None, sheet_id=None):
     """Fetch key stats for one stock. Returns (row_dict, token)."""
@@ -297,26 +305,21 @@ def main():
     con = duckdb.connect(f'md:{MOTHERDUCK_DB}?motherduck_token={MOTHERDUCK_TOKEN}')
     con.execute(f"CREATE SCHEMA IF NOT EXISTS {MD_SCHEMA}")
 
-    # 3. Stock list
+    # 3. Stock list (Rolling Update Strategy)
     args = sys.argv[1:]
     if '--stocks' in args:
         idx = args.index('--stocks')
         stocks = [s.strip().upper() for s in args[idx + 1].split(',')] if idx + 1 < len(args) else []
         print(f"🎯 Custom: {len(stocks)} saham")
     else:
-        stocks = get_stock_codes(con)
+        limit = RUN_LIMIT
         if '--limit' in args:
             idx = args.index('--limit')
             if idx + 1 < len(args):
-                stocks = stocks[:int(args[idx + 1])]
-
-        if '--incremental' in args:
-            existing = get_existing_codes(con)
-            before = len(stocks)
-            stocks = [s for s in stocks if s not in existing]
-            print(f"📋 Incremental: {before} → {len(stocks)} belum terisi")
-        else:
-            print(f"📋 Total: {len(stocks)} emiten (full refresh)")
+                limit = int(args[idx + 1])
+                
+        stocks = get_stale_stock_codes(con, limit=limit)
+        print(f"📋 Mode Rolling Update: Menarik {len(stocks)} saham paling usang (limit={limit})")
 
     # 4. Split into bursts
     bursts = [stocks[i:i + BURST_SIZE] for i in range(0, len(stocks), BURST_SIZE)]
