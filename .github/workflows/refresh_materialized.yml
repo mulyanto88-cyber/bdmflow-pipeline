@@ -96,11 +96,29 @@ jobs:
           if has_column('company_profile', 'company_name'):
               refresh('market.tb_stock_latest', \"\"\"
                   SELECT sl.*, cp.company_name
-                  FROM market.vw_stock_latest sl
-                  LEFT JOIN market.company_profile cp ON cp.stock_code = sl.stock_code
+                  FROM (
+                      SELECT * EXCLUDE (rn)
+                      FROM (
+                          SELECT *, ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY trading_date DESC) AS rn
+                          FROM market.vw_stock_latest
+                      ) WHERE rn = 1
+                  ) sl
+                  LEFT JOIN (
+                      SELECT stock_code, company_name
+                      FROM (
+                          SELECT stock_code, company_name, ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY company_name IS NOT NULL DESC) AS rn
+                          FROM market.company_profile
+                      ) WHERE rn = 1
+                  ) cp ON cp.stock_code = sl.stock_code
               \"\"\")
           else:
-              refresh('market.tb_stock_latest', 'SELECT * FROM market.vw_stock_latest')
+              refresh('market.tb_stock_latest', \"\"\"
+                  SELECT * EXCLUDE (rn)
+                  FROM (
+                      SELECT *, ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY trading_date DESC) AS rn
+                      FROM market.vw_stock_latest
+                  ) WHERE rn = 1
+              \"\"\")
           refresh('market.tb_smart_money_score',  'SELECT * FROM market.vw_smart_money_score')
           refresh('main.tb_broker_rolling_net',   'SELECT * FROM main.vw_broker_rolling_net')
 
