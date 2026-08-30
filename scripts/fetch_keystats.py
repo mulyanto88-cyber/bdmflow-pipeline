@@ -1,5 +1,5 @@
 # =============================================================================
-# STOCKBIT KEY STATS & FUNDAMENTALS PIPELINE — Production Edition
+# STOCKBIT KEY STATS & FUNDAMENTALS PIPELINE — High-Performance Parallel Edition
 # Endpoint: https://exodus.stockbit.com/keystats/ratio/v1/{STOCK_CODE}?year_limit=10
 # =============================================================================
 import os
@@ -10,7 +10,9 @@ import random
 import re
 import requests
 import duckdb
+import threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -27,6 +29,11 @@ MOTHERDUCK_DB    = 'my_db'
 MD_SCHEMA        = 'market'
 MD_TABLE         = 'company_keystats'
 BASE_URL         = 'https://exodus.stockbit.com/keystats/ratio/v1'
+
+# Global Lock for DB Writes & Token Refreshes
+db_lock          = threading.Lock()
+token_lock       = threading.Lock()
+global_token     = None
 
 # =============================================================================
 # HELPERS & PARSERS
@@ -108,41 +115,30 @@ def get_stock_codes(con):
         print(f"⚠️ Gagal ambil list dari company_profile: {e}")
         return ['BBCA', 'BBRI', 'BMRI', 'BBNI', 'ASII', 'TLKM', 'BRMS', 'AMMN', 'BRIS', 'ADRO']
 
-def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=None, preview=True):
+def fetch_keystats_single(session, stock_code, sheets_svc=None, sheet_id=None):
+    global global_token
+    token = global_token
     headers = make_headers(token, stock_code)
-    
-    # 1. Trigger Paywall Eligibility check (same as browser client flow)
-    pw_url = f'https://exodus.stockbit.com/paywall/eligibility/check?features=PAYWALL_FEATURE_KEYSTATS&company={stock_code}'
-    try:
-        pw = session.get(pw_url, headers=headers, timeout=8)
-        try:
-            pw_body = pw.json()
-            pw_data = (pw_body or {}).get('data') or {}
-            feats = pw_data.get('features') or []
-            elig = next((f.get('is_eligible') for f in feats if isinstance(f, dict)), None)
-            print(f"[PW: eligible={elig} subs={pw_data.get('last_subscription')}] ", end='', flush=True)
-        except Exception:
-            print("[PW: ?] ", end='', flush=True)
-    except Exception:
-        pass
-
-    # 2. Fetch Key Stats
     url = f'{BASE_URL}/{stock_code}?year_limit=10'
     
     for attempt in range(3):
         try:
-            r = session.get(url, headers=headers, timeout=20)
+            r = session.get(url, headers=headers, timeout=15)
             
-            # Auto-refresh token if 401/403
+            # Handle token expiration (401/403)
             if r.status_code in (401, 403) and sheets_svc and sheet_id:
-                print(f"\n🔄 Token refresh otomatis untuk {stock_code}...", end='', flush=True)
-                new_token = get_or_refresh_token(sheets_svc, sheet_id)
-                headers = make_headers(new_token, stock_code)
-                time.sleep(2)
+                with token_lock:
+                    if token == global_token: # only one thread triggers refresh
+                        print(f"\n🔄 Token refresh otomatis untuk {stock_code}...", flush=True)
+                        global_token = get_or_refresh_token(sheets_svc, sheet_id)
+                    token = global_token
+                headers = make_headers(token, stock_code)
+                time.sleep(1.5)
                 continue
 
+            # Handle rate limiting (429)
             if r.status_code == 429:
-                time.sleep(5 + attempt * 3)
+                time.sleep(3 + attempt * 2 + random.uniform(0.5, 1.5))
                 continue
 
             r.raise_for_status()
@@ -152,15 +148,11 @@ def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=N
             stats = data.get('stats') or {}
             closure_results = data.get('closure_fin_items_results') or []
 
-            # If payload is empty, log preview and retry
+            # If payload is empty, jitter and retry once
             if not stats and not closure_results:
                 if attempt < 2:
-                    time.sleep(2 + attempt * 2)
+                    time.sleep(1.5 + attempt * 1.5)
                     continue
-                else:
-                    # Log response diagnostic
-                    preview = str(res_json)[:120]
-                    print(f"[Resp: {preview}] ", end='', flush=True)
 
             mcap_b        = clean_val(stats.get('market_cap'))
             shares_out_b  = clean_val(stats.get('current_share_outstanding'))
@@ -182,16 +174,6 @@ def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=N
                 if mrq.get('quarter') and mrq.get('date'):
                     latest_period = f"{mrq.get('quarter')} ({mrq.get('date')})"
                     break
-
-            # Diagnostic: a 200 response that parses to nothing is a paywall /
-            # tier / coverage signal, not a success — print the raw shape once.
-            parsed_any = (
-                mcap_b is not None or shares_out_b is not None or ev_b is not None
-                or free_float is not None or bool(item_map)
-            )
-            if not parsed_any and preview:
-                preview_str = str(res_json)[:400]
-                print(f"[Resp: {preview_str}] ", end='', flush=True)
 
             return {
                 'stock_code':              stock_code,
@@ -249,61 +231,81 @@ def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=N
                 'cash_quarter_b':          item_map.get('Cash (Quarter)'),
                 'total_assets_b':          item_map.get('Total Assets (Quarter)'),
                 'total_liabilities_b':     item_map.get('Total Liabilities (Quarter)'),
-                'total_equity_b':          item_map.get('Total Equity'),
-                'total_debt_b':            item_map.get('Total Debt (Quarter)'),
-                'net_debt_b':              item_map.get('Net Debt (Quarter)'),
-                'cash_from_ops_ttm_b':     item_map.get('Cash From Operations (TTM)'),
-                'free_cash_flow_ttm_b':    item_map.get('Free cash flow (TTM)'),
-
-                # Metadata
+                'total_equity_b':          item_map.get('Total Equity (Quarter)'),
+                'free_cash_flow_ttm_b':    item_map.get('Free Cash Flow (TTM)'),
+                
                 'period_latest':           latest_period,
-                'updated_at':              datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'updated_at':              datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
         except Exception as e:
             if attempt == 2:
-                raise e
-            time.sleep(2)
+                return {'stock_code': stock_code, 'error': str(e)}
+            time.sleep(1.0 + attempt)
+
+    return {'stock_code': stock_code, 'error': 'Max attempts reached'}
+
+def commit_batch_to_db(con, batch_rows):
+    if not batch_rows:
+        return
+    import pandas as pd
+    valid_rows = [
+        r for r in batch_rows 
+        if r.get('pe_ratio_ttm') is not None 
+        or r.get('pbv_ratio') is not None 
+        or r.get('roe_ttm_pct') is not None 
+        or r.get('market_cap_b') is not None
+        or r.get('free_float_pct') is not None
+    ]
+    if not valid_rows:
+        return
+
+    with db_lock:
+        df = pd.DataFrame(valid_rows)
+        con.register('df_batch', df)
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS {MD_SCHEMA}.{MD_TABLE} AS SELECT * FROM df_batch LIMIT 0;
+            DELETE FROM {MD_SCHEMA}.{MD_TABLE} WHERE stock_code IN (SELECT stock_code FROM df_batch);
+            INSERT INTO {MD_SCHEMA}.{MD_TABLE} SELECT * FROM df_batch;
+        """)
+        con.unregister('df_batch')
+        print(f"   💾 [DB] Committed chunk of {len(valid_rows)} valid stocks to MotherDuck!", flush=True)
 
 # =============================================================================
-# MAIN
+# MAIN PIPELINE
 # =============================================================================
 def main():
+    global global_token
     print("=" * 65)
-    print("📊 STOCKBIT KEY STATS & FUNDAMENTALS PIPELINE (v1/ratio)")
+    print("🚀 STOCKBIT KEY STATS & FUNDAMENTALS PIPELINE (PARALLEL EDITION)")
+    print(f"⏰ Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 65)
 
-    # 1. Auth & Token
+    # 1. Google Sheets Auth & Token
+    print("\n🔐 Menghubungkan ke Google Sheets...")
     sheets_svc = authenticate()
-    token = get_or_refresh_token(sheets_svc, TOKEN_SHEET_ID)
+    global_token = get_or_refresh_token(sheets_svc, TOKEN_SHEET_ID)
 
-    # Persistent HTTP Session
-    session = requests.Session()
-
-    # 2. Connect MotherDuck
+    # 2. MotherDuck Connection
+    print("\n🦆 Menghubungkan ke MotherDuck...")
     con = duckdb.connect(f'md:{MOTHERDUCK_DB}?motherduck_token={MOTHERDUCK_TOKEN}')
     con.execute(f"CREATE SCHEMA IF NOT EXISTS {MD_SCHEMA}")
 
-    # Check if existing table has outdated column count, auto drop to migrate.
-    # EXPECTED = jumlah kolom yang dihasilkan row dict di fetch_keystats_stock
-    # (saat ini 50). Penting: angka ini HARUS sama dengan kolom aktual dict,
-    # kalau tidak tabel akan DI-DROP SETIAP RUN dan akumulasi data mingguan
-    # ikut terhapus (bug lama: 46 vs kenyataan 50 → selalu drop).
-    EXPECTED_COLS = 50
-    try:
-        col_count = len(con.execute(f"PRAGMA table_info('{MD_SCHEMA}.{MD_TABLE}')").fetchall())
-        if 0 < col_count != EXPECTED_COLS:
-            print(f"🔄 Menyesuaikan schema tabel {MD_SCHEMA}.{MD_TABLE} ({col_count} -> {EXPECTED_COLS} kolom)...")
-            con.execute(f"DROP TABLE {MD_SCHEMA}.{MD_TABLE}")
-    except Exception:
-        pass
-
-    # 3. Stock List
+    # 3. Stock List & CLI Arguments
     args = sys.argv[1:]
     custom_stocks = None
     if '--stocks' in args:
         idx = args.index('--stocks')
         if idx + 1 < len(args):
             custom_stocks = [s.strip().upper() for s in args[idx + 1].split(',')]
+
+    workers = 6
+    if '--workers' in args:
+        idx = args.index('--workers')
+        if idx + 1 < len(args):
+            try:
+                workers = max(1, min(12, int(args[idx + 1])))
+            except ValueError:
+                pass
 
     if custom_stocks:
         stocks = custom_stocks
@@ -315,126 +317,104 @@ def main():
             if idx + 1 < len(args):
                 limit_n = int(args[idx + 1])
                 stocks = stocks[:limit_n]
-        print(f"📋 Total {len(stocks)} emiten akan diproses...")
+        print(f"📋 Total {len(stocks)} emiten akan diproses dengan {workers} Thread Workers...")
 
-    # 4. Extraction Loop
-    results = []
-    empty_codes = []
+    # 4. Multi-threaded Parallel Extraction
+    session = requests.Session()
+    # Adapter with connection pool
+    adapter = requests.adapters.HTTPAdapter(pool_connections=workers * 2, pool_maxsize=workers * 4, max_retries=2)
+    session.mount('https://', adapter)
+
+    start_time = time.time()
     success_count = 0
     empty_count = 0
     fail_count = 0
+    empty_codes = []
+    
+    batch_buffer = []
+    processed_count = 0
+    total_stocks = len(stocks)
 
-    for i, code in enumerate(stocks, 1):
-        print(f"[{i}/{len(stocks)}] Fetching Key Stats {code}... ", end='', flush=True)
-        try:
-            row = fetch_keystats_stock(session, token, code, sheets_svc=sheets_svc, sheet_id=TOKEN_SHEET_ID)
-            results.append(row)
-            has_any = any(
-                row.get(k) is not None
-                for k in ('pe_ratio_ttm', 'pbv_ratio', 'roe_ttm_pct', 'market_cap_b', 'free_float_pct')
-            )
-            if has_any:
-                success_count += 1
-                print(f"✅ DATA (PER: {row['pe_ratio_ttm'] or '-'}, PBV: {row['pbv_ratio'] or '-'}, ROE: {row['roe_ttm_pct'] or '-'}%)")
-            else:
-                empty_count += 1
-                empty_codes.append(code)
-                print(f"⚠️ KOSONG — 200 OK tapi tidak ada data ter-parse (throttle? lihat [Resp:] di atas)")
-        except Exception as e:
-            fail_count += 1
-            print(f"❌ Gagal: {str(e)[:50]}")
+    print(f"\n⚡ Memulai penarikan paralel ({workers} workers)...")
 
-        # Politeness delay between stocks — the ratio endpoint serves
-        # empty-but-200 payloads when hit too fast, so pace gently.
-        time.sleep(1.2 + random.uniform(0.2, 0.6))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_stock = {
+            executor.submit(fetch_keystats_single, session, code, sheets_svc, TOKEN_SHEET_ID): code
+            for code in stocks
+        }
 
-        # Batch insert to MotherDuck
-        if len(results) >= 25 or i == len(stocks):
-            if results:
-                # Only insert valid records so failures never wipe existing data
-                valid_results = [
-                    r for r in results 
-                    if r.get('pe_ratio_ttm') is not None 
-                    or r.get('pbv_ratio') is not None 
-                    or r.get('roe_ttm_pct') is not None 
-                    or r.get('market_cap_b') is not None
-                    or r.get('free_float_pct') is not None
-                ]
-                if valid_results:
-                    import pandas as pd
-                    df = pd.DataFrame(valid_results)
-                    con.register('df_batch', df)
-                    con.execute(f"""
-                        CREATE TABLE IF NOT EXISTS {MD_SCHEMA}.{MD_TABLE} AS SELECT * FROM df_batch LIMIT 0;
-                        DELETE FROM {MD_SCHEMA}.{MD_TABLE} WHERE stock_code IN (SELECT stock_code FROM df_batch);
-                        INSERT INTO {MD_SCHEMA}.{MD_TABLE} SELECT * FROM df_batch;
-                    """)
-                    con.unregister('df_batch')
-                    print(f"   💾 [DB] Tersimpan batch {len(valid_results)} saham valid ke MotherDuck!")
-                results = []
-
-    # 5. Retry passes — the Stockbit endpoint is cache/throttle-sensitive:
-    # ~25-33% of requests come back 200-but-empty even though eligibility is
-    # granted. Empirically, retrying LATER recovers a meaningful fraction each
-    # round (run 3: +6/18 on round 1). More rounds + longer pauses = more
-    # coverage; the table persists between weekly runs, so coverage also
-    # accumulates over time.
-    args = sys.argv[1:]
-    retry_rounds = 2
-    if '--retry-rounds' in args:
-        idx = args.index('--retry-rounds')
-        if idx + 1 < len(args):
+        for future in as_completed(future_to_stock):
+            code = future_to_stock[future]
+            processed_count += 1
             try:
-                retry_rounds = max(0, min(5, int(args[idx + 1])))
-            except ValueError:
-                pass
-
-    recovered_total = 0
-    for rnd in range(1, retry_rounds + 1):
-        if not empty_codes:
-            break
-        wait = 20 if rnd == 1 else 90 * (rnd - 1)
-        print(f"\n🔁 Retry ronde {rnd}/{retry_rounds} untuk {len(empty_codes)} saham KOSONG — jeda {wait} detik...")
-        time.sleep(wait)
-        retry_rows = []
-        still_empty = []
-        for code in empty_codes:
-            print(f"   ↻ {code}... ", end='', flush=True)
-            try:
-                row = fetch_keystats_stock(session, token, code, preview=False)
-                has_any = any(
-                    row.get(k) is not None
-                    for k in ('pe_ratio_ttm', 'pbv_ratio', 'roe_ttm_pct', 'market_cap_b', 'free_float_pct')
-                )
-                if has_any:
-                    recovered_total += 1
-                    retry_rows.append(row)
-                    print(f"✅ PULIH (PER: {row['pe_ratio_ttm'] or '-'}, PBV: {row['pbv_ratio'] or '-'})")
+                row = future.result()
+                if row.get('error'):
+                    fail_count += 1
+                    print(f"❌ [{processed_count}/{total_stocks}] {code}: {row['error'][:30]}", flush=True)
                 else:
-                    still_empty.append(code)
-                    print("masih KOSONG")
+                    has_any = any(
+                        row.get(k) is not None
+                        for k in ('pe_ratio_ttm', 'pbv_ratio', 'roe_ttm_pct', 'market_cap_b', 'free_float_pct')
+                    )
+                    if has_any:
+                        success_count += 1
+                        batch_buffer.append(row)
+                        print(f"✅ [{processed_count}/{total_stocks}] {code} (PER: {row['pe_ratio_ttm'] or '-'}, PBV: {row['pbv_ratio'] or '-'}, ROE: {row['roe_ttm_pct'] or '-'}%)", flush=True)
+                    else:
+                        empty_count += 1
+                        empty_codes.append(code)
+                        print(f"⚠️ [{processed_count}/{total_stocks}] {code} [KOSONG / 200 OK]", flush=True)
             except Exception as e:
-                still_empty.append(code)
-                print(f"gagal: {str(e)[:40]}")
-            time.sleep(2.5)
-        empty_codes = still_empty
+                fail_count += 1
+                print(f"❌ [{processed_count}/{total_stocks}] {code} Exception: {str(e)[:30]}", flush=True)
+
+            # Atomic commit every 25 stocks
+            if len(batch_buffer) >= 25:
+                to_commit = list(batch_buffer)
+                batch_buffer = []
+                commit_batch_to_db(con, to_commit)
+
+    # Commit any remaining buffered stocks
+    if batch_buffer:
+        commit_batch_to_db(con, batch_buffer)
+        batch_buffer = []
+
+    elapsed = time.time() - start_time
+    print("\n" + "=" * 65)
+    print(f"🏁 Ronde Utama Selesai dalam {elapsed:.1f} detik ({elapsed/60:.1f} menit)!")
+    print(f"📊 Hasil: ✅ Berhasil: {success_count} · ⚠️ Kosong: {empty_count} · ❌ Gagal: {fail_count}")
+    print("=" * 65)
+
+    # 5. Fast Retry Pass for Empty/Failed Codes
+    if empty_codes:
+        print(f"\n🔁 Melakukan Quick Retry untuk {len(empty_codes)} saham kosong...")
+        retry_rows = []
+        with ThreadPoolExecutor(max_workers=min(4, workers)) as executor:
+            future_retry = {
+                executor.submit(fetch_keystats_single, session, code, sheets_svc, TOKEN_SHEET_ID): code
+                for code in empty_codes
+            }
+            for future in as_completed(future_retry):
+                code = future_retry[future]
+                try:
+                    row = future.result()
+                    has_any = any(
+                        row.get(k) is not None
+                        for k in ('pe_ratio_ttm', 'pbv_ratio', 'roe_ttm_pct', 'market_cap_b', 'free_float_pct')
+                    )
+                    if has_any:
+                        retry_rows.append(row)
+                        print(f"   ↻ ✅ PULIH {code}!", flush=True)
+                except Exception:
+                    pass
 
         if retry_rows:
-            import pandas as pd
-            df = pd.DataFrame(retry_rows)
-            con.register('df_retry', df)
-            con.execute(f"""
-                CREATE TABLE IF NOT EXISTS {MD_SCHEMA}.{MD_TABLE} AS SELECT * FROM df_retry LIMIT 0;
-                DELETE FROM {MD_SCHEMA}.{MD_TABLE} WHERE stock_code IN (SELECT stock_code FROM df_retry);
-                INSERT INTO {MD_SCHEMA}.{MD_TABLE} SELECT * FROM df_retry;
-            """)
-            con.unregister('df_retry')
-            print(f"   💾 [DB] Ronde {rnd} tersimpan {len(retry_rows)} saham pulih!")
+            commit_batch_to_db(con, retry_rows)
+            print(f"   💾 [DB] Berhasil memulihkan {len(retry_rows)} saham dari retry pass!")
 
     total_in_db = con.execute(f"SELECT COUNT(*) FROM {MD_SCHEMA}.{MD_TABLE}").fetchone()[0]
-    print("=" * 65)
-    print(f"🎉 SELESAI! Data: {success_count} · KOSONG: {empty_count} · Pulih total (retry): {recovered_total} · Gagal: {fail_count}")
-    print(f"📊 Total emiten di {MD_SCHEMA}.{MD_TABLE}: {total_in_db} rows")
+    print("\n" + "=" * 65)
+    print(f"🎉 PIPELINE SELESAI! Total emiten tersimpan di {MD_SCHEMA}.{MD_TABLE}: {total_in_db} emiten.")
     print("=" * 65)
     con.close()
 
