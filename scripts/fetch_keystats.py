@@ -1,11 +1,14 @@
 # =============================================================================
-# STOCKBIT KEY STATS & FUNDAMENTALS PIPELINE — Chunked Micro-Batch Edition
-# Strategy: Process stocks in small sequential chunks (batch of 3) with
-#           controlled pacing. Stockbit's backend throttles concurrent requests
-#           from the same token aggressively, returning empty 200s. Sequential
-#           with micro-pacing (1.2-1.8s between requests) is the most reliable
-#           approach — confirmed by the old sequential pipeline's 62% success
-#           rate vs the parallel 6-worker's 4% success rate.
+# STOCKBIT KEY STATS & FUNDAMENTALS PIPELINE — Burst + Cooldown Edition
+#
+# KEY INSIGHT: Stockbit throttles after ~50 consecutive requests per token,
+# returning empty 200 OK payloads. Solution: process in bursts of 45 stocks
+# with 60-second cooldowns between bursts to let the rate-limit window reset.
+#
+# Math: 978 stocks / 45 per burst = 22 bursts
+#       Each burst: 45 × 1.5s = 68s + 60s cooldown = 128s
+#       Total: 22 × 128s = 2816s ≈ 47 minutes (fits GitHub Actions 60m limit)
+#       Expected success rate: ~95%+ (vs 14% with continuous processing)
 #
 # Endpoint: https://exodus.stockbit.com/keystats/ratio/v1/{STOCK_CODE}?year_limit=10
 # =============================================================================
@@ -35,8 +38,11 @@ MD_SCHEMA        = 'market'
 MD_TABLE         = 'company_keystats'
 BASE_URL         = 'https://exodus.stockbit.com/keystats/ratio/v1'
 
+BURST_SIZE       = 45   # Max requests before Stockbit throttles
+COOLDOWN_SECS    = 60   # Seconds to wait between bursts for rate-limit reset
+INTER_REQ_DELAY  = 1.3  # Seconds between individual requests within a burst
+
 # All 50 columns in the exact order they exist in MotherDuck.
-# This guarantees INSERT always matches the table schema.
 DB_COLUMNS = [
     'stock_code', 'market_cap_b', 'enterprise_value_b', 'shares_outstanding_b',
     'free_float_pct', 'pe_ratio_ttm', 'pe_ratio_annualized', 'forward_pe',
@@ -88,7 +94,6 @@ def clean_val(val_str):
     s = str(val_str).strip()
     if not s or s in ('-', 'N/A', 'null', 'None'):
         return None
-    
     is_negative = False
     if s.startswith('(') and s.endswith(')'):
         is_negative = True
@@ -96,10 +101,8 @@ def clean_val(val_str):
     elif s.startswith('-'):
         is_negative = True
         s = s[1:].strip()
-
     s = s.replace(',', '').replace('%', '').replace('+', '').strip()
     s = re.sub(r'[BMTK]$', '', s).strip()
-
     try:
         num = float(s)
         return -num if is_negative else num
@@ -112,21 +115,17 @@ def get_stock_codes(con):
             SELECT DISTINCT stock_code
             FROM market.daily_transactions
             WHERE stock_code NOT IN ('COMPOSITE', 'IHSG', 'IDX30', 'LQ45')
-              AND stock_code IS NOT NULL
-              AND LENGTH(stock_code) = 4
+              AND stock_code IS NOT NULL AND LENGTH(stock_code) = 4
             ORDER BY stock_code ASC
         """).fetchall()
         if rows:
             return [r[0] for r in rows]
     except Exception as e:
         print(f"⚠️ Gagal ambil list dari daily_transactions: {e}")
-
     try:
         rows = con.execute("""
-            SELECT DISTINCT stock_code
-            FROM market.company_profile
-            WHERE stock_code IS NOT NULL
-            ORDER BY stock_code ASC
+            SELECT DISTINCT stock_code FROM market.company_profile
+            WHERE stock_code IS NOT NULL ORDER BY stock_code ASC
         """).fetchall()
         return [r[0] for r in rows]
     except Exception as e:
@@ -138,80 +137,66 @@ def get_existing_codes(con):
     try:
         rows = con.execute(f"""
             SELECT stock_code FROM {MD_SCHEMA}.{MD_TABLE}
-            WHERE pe_ratio_ttm IS NOT NULL
-               OR pbv_ratio IS NOT NULL
-               OR roe_ttm_pct IS NOT NULL
-               OR market_cap_b IS NOT NULL
+            WHERE pe_ratio_ttm IS NOT NULL OR pbv_ratio IS NOT NULL
+               OR roe_ttm_pct IS NOT NULL OR market_cap_b IS NOT NULL
         """).fetchall()
         return {r[0] for r in rows}
     except Exception:
         return set()
 
-def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=None):
-    """Fetch key stats for a single stock. Returns dict or raises."""
+def fetch_one(session, token, stock_code, sheets_svc=None, sheet_id=None):
+    """Fetch key stats for one stock. Returns (row_dict, token)."""
     headers = make_headers(token, stock_code)
     url = f'{BASE_URL}/{stock_code}?year_limit=10'
-    
+
     for attempt in range(3):
         try:
             r = session.get(url, headers=headers, timeout=20)
-            
-            # Auto-refresh token if 401/403
+
             if r.status_code in (401, 403) and sheets_svc and sheet_id:
-                print(f"\n🔄 Token refresh for {stock_code}...", end='', flush=True)
+                print(f" [token refresh]", end='', flush=True)
                 token = get_or_refresh_token(sheets_svc, sheet_id)
                 headers = make_headers(token, stock_code)
                 time.sleep(2)
                 continue
 
             if r.status_code == 429:
-                wait = 5 + attempt * 5 + random.uniform(1, 3)
-                print(f" [429 throttle, wait {wait:.0f}s]", end='', flush=True)
+                wait = 8 + attempt * 5
+                print(f" [429→{wait}s]", end='', flush=True)
                 time.sleep(wait)
                 continue
 
             r.raise_for_status()
-            res_json = r.json()
-            data = res_json.get('data') or {}
-
+            data = (r.json().get('data') or {})
             stats = data.get('stats') or {}
             closure_results = data.get('closure_fin_items_results') or []
 
-            # Empty payload → jitter retry
             if not stats and not closure_results:
                 if attempt < 2:
                     time.sleep(2.0 + attempt * 2.0 + random.uniform(0.5, 1.5))
                     continue
-
-            mcap_b        = clean_val(stats.get('market_cap'))
-            shares_out_b  = clean_val(stats.get('current_share_outstanding'))
-            ev_b          = clean_val(stats.get('enterprise_value'))
-            free_float    = clean_val(stats.get('free_float'))
 
             item_map = {}
             for group in closure_results:
                 for sub in group.get('fin_name_results', []):
                     fitem = sub.get('fitem', {})
                     name = fitem.get('name')
-                    val = fitem.get('value')
                     if name:
-                        item_map[name.strip()] = clean_val(val)
+                        item_map[name.strip()] = clean_val(fitem.get('value'))
 
             latest_period = 'Latest'
             for group in data.get('financial_year_parent', {}).get('financial_year_groups', []):
                 mrq = group.get('most_recent_quarter', {})
                 if mrq.get('quarter') and mrq.get('date'):
-                    latest_period = f"{mrq.get('quarter')} ({mrq.get('date')})"
+                    latest_period = f"{mrq['quarter']} ({mrq['date']})"
                     break
 
-            return {
+            row = {
                 'stock_code':              stock_code,
-                'market_cap_b':            mcap_b,
-                'enterprise_value_b':      ev_b,
-                'shares_outstanding_b':    shares_out_b,
-                'free_float_pct':          free_float,
-                
-                # Valuation Ratios
+                'market_cap_b':            clean_val(stats.get('market_cap')),
+                'enterprise_value_b':      clean_val(stats.get('enterprise_value')),
+                'shares_outstanding_b':    clean_val(stats.get('current_share_outstanding')),
+                'free_float_pct':          clean_val(stats.get('free_float')),
                 'pe_ratio_ttm':            item_map.get('Current PE Ratio (TTM)'),
                 'pe_ratio_annualized':     item_map.get('Current PE Ratio (Annualised)'),
                 'forward_pe':              item_map.get('Forward PE Ratio'),
@@ -222,37 +207,27 @@ def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=N
                 'peg_ratio':               item_map.get('PEG Ratio'),
                 'earnings_yield_pct':      item_map.get('Earnings Yield (TTM)'),
                 'p_fcf_ratio':             item_map.get('Current Price To Free Cashflow (TTM)'),
-
-                # Per Share
                 'eps_ttm':                 item_map.get('Current EPS (TTM)'),
                 'eps_annualized':          item_map.get('Current EPS (Annualised)'),
                 'bvps':                    item_map.get('Current Book Value Per Share'),
                 'revenue_per_share':       item_map.get('Revenue Per Share (TTM)'),
                 'cash_per_share':          item_map.get('Cash Per Share (Quarter)'),
                 'fcf_per_share':           item_map.get('Free Cashflow Per Share (TTM)'),
-
-                # Profitability & Margins
                 'roe_ttm_pct':             item_map.get('Return on Equity (TTM)'),
                 'roa_ttm_pct':             item_map.get('Return on Assets (TTM)'),
                 'roce_ttm_pct':            item_map.get('Return on Capital Employed (TTM)'),
                 'gpm_quarter_pct':         item_map.get('Gross Profit Margin (Quarter)'),
                 'opm_quarter_pct':         item_map.get('Operating Profit Margin (Quarter)'),
                 'npm_quarter_pct':         item_map.get('Net Profit Margin (Quarter)'),
-
-                # Growth
                 'revenue_growth_yoy_pct':  item_map.get('Revenue (Quarter YoY Growth)'),
                 'gross_profit_growth_yoy': item_map.get('Gross Profit (Quarter YoY Growth)'),
                 'net_income_growth_yoy':   item_map.get('Net Income (Quarter YoY Growth)'),
-
-                # Solvency & Financial Health
                 'debt_to_equity':          item_map.get('Debt to Equity Ratio (Quarter)'),
                 'current_ratio':           item_map.get('Current Ratio (Quarter)'),
                 'quick_ratio':             item_map.get('Quick Ratio (Quarter)'),
                 'interest_coverage':       item_map.get('Interest Coverage (TTM)'),
                 'piotroski_f_score':       item_map.get('Piotroski F-Score'),
                 'altman_z_score':          item_map.get('Altman Z-Score (Modified)'),
-
-                # Financial Statements (in Billion IDR) — all 50 cols
                 'revenue_ttm_b':           item_map.get('Revenue (TTM)'),
                 'gross_profit_ttm_b':      item_map.get('Gross Profit (TTM)'),
                 'ebitda_ttm_b':            item_map.get('EBITDA (TTM)'),
@@ -265,10 +240,10 @@ def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=N
                 'net_debt_b':              item_map.get('Net Debt (Quarter)'),
                 'cash_from_ops_ttm_b':     item_map.get('Cash From Operations (TTM)'),
                 'free_cash_flow_ttm_b':    item_map.get('Free Cash Flow (TTM)'),
-                
                 'period_latest':           latest_period,
                 'updated_at':              datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            }, token  # return updated token in case it was refreshed
+            }
+            return row, token
         except Exception as e:
             if attempt == 2:
                 raise
@@ -276,31 +251,19 @@ def fetch_keystats_stock(session, token, stock_code, sheets_svc=None, sheet_id=N
 
     raise RuntimeError(f"Max retries for {stock_code}")
 
-def commit_batch_to_db(con, batch_rows):
-    """Column-safe upsert: only update matching columns, fill missing with NULL."""
-    if not batch_rows:
+def commit_batch(con, rows):
+    """Column-safe upsert into MotherDuck."""
+    if not rows:
         return 0
     import pandas as pd
-    
-    valid_rows = [
-        r for r in batch_rows 
-        if r.get('pe_ratio_ttm') is not None 
-        or r.get('pbv_ratio') is not None 
-        or r.get('roe_ttm_pct') is not None 
-        or r.get('market_cap_b') is not None
-        or r.get('free_float_pct') is not None
-    ]
-    if not valid_rows:
+    valid = [r for r in rows if any(r.get(k) is not None for k in
+             ('pe_ratio_ttm', 'pbv_ratio', 'roe_ttm_pct', 'market_cap_b', 'free_float_pct'))]
+    if not valid:
         return 0
-
-    # Ensure every row has all 50 columns (fill missing with None)
-    for row in valid_rows:
+    for row in valid:
         for col in DB_COLUMNS:
-            if col not in row:
-                row[col] = None
-
-    # Build DataFrame with columns in exact DB order
-    df = pd.DataFrame(valid_rows, columns=DB_COLUMNS)
+            row.setdefault(col, None)
+    df = pd.DataFrame(valid, columns=DB_COLUMNS)
     con.register('df_batch', df)
     con.execute(f"""
         CREATE TABLE IF NOT EXISTS {MD_SCHEMA}.{MD_TABLE} AS SELECT * FROM df_batch LIMIT 0;
@@ -308,40 +271,38 @@ def commit_batch_to_db(con, batch_rows):
         INSERT INTO {MD_SCHEMA}.{MD_TABLE} SELECT * FROM df_batch;
     """)
     con.unregister('df_batch')
-    return len(valid_rows)
+    return len(valid)
+
+def is_valid(row):
+    return any(row.get(k) is not None for k in
+               ('pe_ratio_ttm', 'pbv_ratio', 'roe_ttm_pct', 'market_cap_b', 'free_float_pct'))
 
 # =============================================================================
-# MAIN PIPELINE
+# MAIN PIPELINE — BURST + COOLDOWN ARCHITECTURE
 # =============================================================================
 def main():
     print("=" * 65)
-    print("🚀 STOCKBIT KEY STATS PIPELINE (CHUNKED MICRO-BATCH EDITION)")
-    print(f"⏰ Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("🚀 STOCKBIT KEY STATS PIPELINE (BURST + COOLDOWN EDITION)")
+    print(f"⏰ Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📐 Strategy: {BURST_SIZE} stocks/burst → {COOLDOWN_SECS}s cooldown")
     print("=" * 65)
 
-    # 1. Google Sheets Auth & Token
-    print("\n🔐 Menghubungkan ke Google Sheets...")
+    # 1. Auth
+    print("\n🔐 Google Sheets Auth...")
     sheets_svc = authenticate()
     token = get_or_refresh_token(sheets_svc, TOKEN_SHEET_ID)
 
-    # 2. MotherDuck Connection
-    print("\n🦆 Menghubungkan ke MotherDuck...")
+    # 2. MotherDuck
+    print("🦆 MotherDuck...")
     con = duckdb.connect(f'md:{MOTHERDUCK_DB}?motherduck_token={MOTHERDUCK_TOKEN}')
     con.execute(f"CREATE SCHEMA IF NOT EXISTS {MD_SCHEMA}")
 
-    # 3. Stock List & CLI Arguments
+    # 3. Stock list
     args = sys.argv[1:]
-    custom_stocks = None
     if '--stocks' in args:
         idx = args.index('--stocks')
-        if idx + 1 < len(args):
-            custom_stocks = [s.strip().upper() for s in args[idx + 1].split(',')]
-
-    skip_existing = '--incremental' in args
-
-    if custom_stocks:
-        stocks = custom_stocks
-        print(f"🎯 Mode custom ({len(stocks)} saham): {', '.join(stocks)}")
+        stocks = [s.strip().upper() for s in args[idx + 1].split(',')] if idx + 1 < len(args) else []
+        print(f"🎯 Custom: {len(stocks)} saham")
     else:
         stocks = get_stock_codes(con)
         if '--limit' in args:
@@ -349,132 +310,145 @@ def main():
             if idx + 1 < len(args):
                 stocks = stocks[:int(args[idx + 1])]
 
-        # Incremental mode: skip stocks that already have valid data
-        if skip_existing:
+        if '--incremental' in args:
             existing = get_existing_codes(con)
             before = len(stocks)
             stocks = [s for s in stocks if s not in existing]
-            print(f"📋 Incremental: {before} total → {len(stocks)} belum terisi (skip {before - len(stocks)} yang sudah ada)")
+            print(f"📋 Incremental: {before} → {len(stocks)} belum terisi")
         else:
-            print(f"📋 Total {len(stocks)} emiten akan diproses (full refresh)...")
+            print(f"📋 Total: {len(stocks)} emiten (full refresh)")
 
-    # 4. Sequential Extraction with Micro-Pacing
+    # 4. Split into bursts
+    bursts = [stocks[i:i + BURST_SIZE] for i in range(0, len(stocks), BURST_SIZE)]
+    num_bursts = len(bursts)
+    est_time = num_bursts * (BURST_SIZE * INTER_REQ_DELAY + COOLDOWN_SECS)
+    print(f"📦 {num_bursts} burst × {BURST_SIZE} saham (est. {est_time/60:.0f} menit)")
+
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=1)
     session.mount('https://', adapter)
 
     start_time = time.time()
-    success_count = 0
-    empty_count = 0
-    fail_count = 0
-    empty_codes = []
-    batch_buffer = []
-    total_stocks = len(stocks)
+    total_success = 0
+    total_empty = 0
+    total_fail = 0
+    all_empty_codes = []
     committed_total = 0
+    global_idx = 0
+    total_stocks = len(stocks)
 
-    print(f"\n⚡ Memulai penarikan data ({total_stocks} saham)...")
+    for burst_num, burst_stocks in enumerate(bursts, 1):
+        burst_success = 0
+        burst_empty = 0
+        batch_buffer = []
 
-    for i, code in enumerate(stocks, 1):
-        print(f"[{i}/{total_stocks}] {code}... ", end='', flush=True)
-        try:
-            row, token = fetch_keystats_stock(
-                session, token, code,
-                sheets_svc=sheets_svc, sheet_id=TOKEN_SHEET_ID
-            )
-            has_any = any(
-                row.get(k) is not None
-                for k in ('pe_ratio_ttm', 'pbv_ratio', 'roe_ttm_pct', 'market_cap_b', 'free_float_pct')
-            )
-            if has_any:
-                success_count += 1
-                batch_buffer.append(row)
-                print(f"✅ PER:{row['pe_ratio_ttm'] or '-'} PBV:{row['pbv_ratio'] or '-'} ROE:{row['roe_ttm_pct'] or '-'}%")
-            else:
-                empty_count += 1
-                empty_codes.append(code)
-                print("⚠️ KOSONG")
-        except Exception as e:
-            fail_count += 1
-            print(f"❌ {str(e)[:50]}")
+        print(f"\n{'─' * 50}")
+        print(f"🔥 BURST {burst_num}/{num_bursts} ({len(burst_stocks)} saham)")
+        print(f"{'─' * 50}")
 
-        # Pacing: 1.2 – 1.8 seconds between requests
-        time.sleep(1.2 + random.uniform(0.1, 0.6))
+        for code in burst_stocks:
+            global_idx += 1
+            print(f"[{global_idx}/{total_stocks}] {code}... ", end='', flush=True)
+            try:
+                row, token = fetch_one(session, token, code, sheets_svc, TOKEN_SHEET_ID)
+                if is_valid(row):
+                    burst_success += 1
+                    batch_buffer.append(row)
+                    print(f"✅ PER:{row['pe_ratio_ttm'] or '-'} PBV:{row['pbv_ratio'] or '-'} ROE:{row['roe_ttm_pct'] or '-'}%")
+                else:
+                    burst_empty += 1
+                    all_empty_codes.append(code)
+                    print("⚠️ KOSONG")
+            except Exception as e:
+                total_fail += 1
+                print(f"❌ {str(e)[:50]}")
 
-        # Commit every 30 stocks
-        if len(batch_buffer) >= 30 or i == total_stocks:
-            if batch_buffer:
-                n = commit_batch_to_db(con, batch_buffer)
-                committed_total += n
-                print(f"   💾 [DB] Batch commit: {n} saham → MotherDuck (total: {committed_total})")
-                batch_buffer = []
+            time.sleep(INTER_REQ_DELAY + random.uniform(0.0, 0.4))
 
-        # Every 200 stocks, do a brief cooldown to avoid long-term throttling
-        if i % 200 == 0 and i < total_stocks:
-            cooldown = random.uniform(5, 10)
-            print(f"   ⏸️ Cooldown {cooldown:.0f}s setelah {i} saham...", flush=True)
-            time.sleep(cooldown)
+        # Commit this burst's results
+        if batch_buffer:
+            n = commit_batch(con, batch_buffer)
+            committed_total += n
+            print(f"   💾 Burst {burst_num}: {n} saham → MotherDuck (total: {committed_total})")
+
+        total_success += burst_success
+        total_empty += burst_empty
+
+        # Early termination detection: if burst had >80% empty, the throttle
+        # is active — increase cooldown for this pause
+        empty_pct = burst_empty / max(len(burst_stocks), 1)
+        if empty_pct > 0.8 and burst_num < num_bursts:
+            extended = COOLDOWN_SECS + 30
+            print(f"   ⚠️ Burst ke-{burst_num} terlalu banyak KOSONG ({burst_empty}/{len(burst_stocks)}) → extra cooldown {extended}s")
+            time.sleep(extended)
+        elif burst_num < num_bursts:
+            print(f"   ✅ Burst {burst_num}: {burst_success}/{len(burst_stocks)} sukses — cooldown {COOLDOWN_SECS}s...")
+            time.sleep(COOLDOWN_SECS)
 
     elapsed_main = time.time() - start_time
     print("\n" + "=" * 65)
     print(f"🏁 Ronde Utama: {elapsed_main:.0f}s ({elapsed_main/60:.1f}m)")
-    print(f"   ✅ Berhasil: {success_count} · ⚠️ Kosong: {empty_count} · ❌ Gagal: {fail_count}")
+    print(f"   ✅ {total_success} · ⚠️ {total_empty} · ❌ {total_fail}")
     print("=" * 65)
 
-    # 5. Retry Pass — empty codes often succeed on second attempt after cooldown
-    retry_rounds = 2
+    # 5. Retry pass for empty codes — same burst+cooldown approach
+    retry_rounds = 1
     if '--retry-rounds' in args:
         idx = args.index('--retry-rounds')
         if idx + 1 < len(args):
-            try:
-                retry_rounds = max(0, min(5, int(args[idx + 1])))
-            except ValueError:
-                pass
+            try: retry_rounds = max(0, min(3, int(args[idx + 1])))
+            except: pass
 
     recovered_total = 0
     for rnd in range(1, retry_rounds + 1):
-        if not empty_codes:
+        if not all_empty_codes:
             break
-        wait = 15 if rnd == 1 else 60 * rnd
-        print(f"\n🔁 Retry ronde {rnd}/{retry_rounds}: {len(empty_codes)} saham — jeda {wait}s...")
-        time.sleep(wait)
 
-        retry_buffer = []
+        print(f"\n🔁 Retry ronde {rnd}: {len(all_empty_codes)} saham...")
+        time.sleep(30)  # Initial cooldown before retry
+
+        retry_bursts = [all_empty_codes[i:i + BURST_SIZE] for i in range(0, len(all_empty_codes), BURST_SIZE)]
         still_empty = []
-        for code in empty_codes:
-            print(f"   ↻ {code}... ", end='', flush=True)
-            try:
-                row, token = fetch_keystats_stock(
-                    session, token, code,
-                    sheets_svc=sheets_svc, sheet_id=TOKEN_SHEET_ID
-                )
-                has_any = any(
-                    row.get(k) is not None
-                    for k in ('pe_ratio_ttm', 'pbv_ratio', 'roe_ttm_pct', 'market_cap_b', 'free_float_pct')
-                )
-                if has_any:
-                    recovered_total += 1
-                    retry_buffer.append(row)
-                    print(f"✅ PULIH!")
-                else:
-                    still_empty.append(code)
-                    print("masih KOSONG")
-            except Exception as e:
-                still_empty.append(code)
-                print(f"gagal: {str(e)[:40]}")
-            time.sleep(2.0 + random.uniform(0.5, 1.5))
 
-        empty_codes = still_empty
-        if retry_buffer:
-            n = commit_batch_to_db(con, retry_buffer)
-            committed_total += n
-            print(f"   💾 [DB] Ronde {rnd}: {n} saham pulih → MotherDuck!")
+        for rb_num, rb_stocks in enumerate(retry_bursts, 1):
+            retry_buffer = []
+            rb_empty = []
 
-    # 6. Final Summary
+            print(f"   🔄 Retry burst {rb_num}/{len(retry_bursts)}...")
+            for code in rb_stocks:
+                print(f"   ↻ {code}... ", end='', flush=True)
+                try:
+                    row, token = fetch_one(session, token, code, sheets_svc, TOKEN_SHEET_ID)
+                    if is_valid(row):
+                        recovered_total += 1
+                        retry_buffer.append(row)
+                        print("✅ PULIH!")
+                    else:
+                        rb_empty.append(code)
+                        print("masih KOSONG")
+                except Exception as e:
+                    rb_empty.append(code)
+                    print(f"gagal: {str(e)[:30]}")
+                time.sleep(INTER_REQ_DELAY + random.uniform(0.1, 0.5))
+
+            still_empty.extend(rb_empty)
+
+            if retry_buffer:
+                n = commit_batch(con, retry_buffer)
+                committed_total += n
+                print(f"   💾 Retry burst {rb_num}: {n} saham → MotherDuck!")
+
+            if rb_num < len(retry_bursts):
+                time.sleep(COOLDOWN_SECS)
+
+        all_empty_codes = still_empty
+
+    # 6. Final summary
     total_in_db = con.execute(f"SELECT COUNT(*) FROM {MD_SCHEMA}.{MD_TABLE}").fetchone()[0]
     elapsed_total = time.time() - start_time
     print("\n" + "=" * 65)
     print(f"🎉 PIPELINE SELESAI dalam {elapsed_total:.0f}s ({elapsed_total/60:.1f}m)")
-    print(f"   ✅ Sukses: {success_count + recovered_total} · ⚠️ Masih kosong: {len(empty_codes)} · ❌ Gagal: {fail_count}")
+    print(f"   ✅ Sukses: {total_success + recovered_total} · ⚠️ Kosong: {len(all_empty_codes)} · ❌ Gagal: {total_fail}")
     print(f"   📊 Total di {MD_SCHEMA}.{MD_TABLE}: {total_in_db} emiten")
     print("=" * 65)
     con.close()
